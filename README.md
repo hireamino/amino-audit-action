@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: your-org/amino-audit-action@v1
+      - uses: hireamino/amino-audit-action@v1
         with:
           domains: example.com
           # Default is advisory (report-only). Flip to enforce once you trust it:
@@ -48,7 +48,7 @@ jobs:
       contents: read
       pull-requests: write   # required ONLY for comment-on-pr
     steps:
-      - uses: your-org/amino-audit-action@v1
+      - uses: hireamino/amino-audit-action@v1
         with:
           domains: |
             example.com
