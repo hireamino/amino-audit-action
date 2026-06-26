@@ -95,14 +95,24 @@ function advisoryReason(worst) {
 
 // ── Markdown rendering ────────────────────────────────────────────────────────
 
-// Escape a cell value for a GitHub markdown table: pipes and newlines would break
-// the table, and we also neutralize HTML-ish brackets defensively.
+// Defang an attacker-influenced string for safe inclusion as PLAIN markdown text
+// (table cells, prose). DNS-derived values are controlled by the audited domain's
+// owner, and this output is also posted to PR comments under a token — so we must
+// neutralize ACTIVE markdown, not just table structure: links/images (beacons),
+// @mentions / #refs (notify third parties), code-span breakout, emphasis, raw
+// HTML, and the table pipe. Backslash-escape every CommonMark-escapable punctuation
+// that can start active syntax; strip control + zero-width chars.
 export function mdCell(s) {
   return String(s == null ? "" : s)
-    .replace(/\r?\n/g, " ")
-    .replace(/\|/g, "\\|")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
+    .replace(/[\x00-\x1f\x7f]/g, " ")
+    .replace(/([\\`*_{}\[\]()#+!|<>@~])/g, "\\$1")
+    .trim();
+}
+
+// Inside a backtick code span only a backtick is active; strip it (escaping won't help).
+export function code(s) {
+  return String(s == null ? "" : s)
+    .replace(/[`\x00-\x1f\x7f]/g, " ")
     .trim();
 }
 
@@ -133,7 +143,7 @@ export function renderSummary(results, decision) {
 
   for (const r of results) {
     const { counts, verdict } = verdictLine(r);
-    lines.push(`### \`${mdCell(r.domain)}\` — ${verdict}`);
+    lines.push(`### \`${code(r.domain)}\` — ${verdict}`);
     if (r.error) {
       lines.push("");
       lines.push(`> Audit failed: ${mdCell(r.error)}`);
@@ -141,7 +151,7 @@ export function renderSummary(results, decision) {
       continue;
     }
     lines.push("");
-    lines.push(`**${counts}**${r.primary_mx ? ` · primary MX: \`${mdCell(r.primary_mx)}\`` : ""}`);
+    lines.push(`**${counts}**${r.primary_mx ? ` · primary MX: \`${code(r.primary_mx)}\`` : ""}`);
     lines.push("");
     const gaps = (r.findings || []).filter((f) => f.severity !== "pass");
     if (!gaps.length) {

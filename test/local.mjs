@@ -12,6 +12,7 @@ import {
   worstSeverity,
   decide,
   mdCell,
+  code,
   renderSummary,
   summaryOutput,
 } from "../src/index.mjs";
@@ -93,10 +94,24 @@ check("critical passes on high", decide([mkResult("a", ["high"])], "critical").p
 // reason string present
 check("decision carries a reason", typeof decide([mkResult("a", ["high"])], "high").reason === "string" && decide([mkResult("a", ["high"])], "high").reason.length > 0);
 
-console.log("== mdCell escaping ==");
+console.log("== mdCell / code: comment-grade defanging (SEC) ==");
 check("escapes pipe", mdCell("a|b") === "a\\|b");
-check("collapses newline", mdCell("a\nb") === "a b");
-check("escapes angle brackets", mdCell("<x>") === "&lt;x&gt;");
+check("strips control chars (newline → space)", mdCell("a\nb") === "a b");
+check("backslash-escapes angle brackets (no raw HTML)", mdCell("<x>") === "\\<x\\>");
+// HIGH fix: attacker-controlled DNS values must not yield ACTIVE markdown in a PR comment.
+check("defangs image beacon", mdCell("![x](https://evil.tld/b.png)").startsWith("\\!\\["));
+check("defangs link", mdCell("[a](javascript:alert(1))").startsWith("\\["));
+check("escapes @mention", mdCell("@octocat") === "\\@octocat");
+check("escapes #ref", mdCell("#1") === "\\#1");
+check("escapes backtick", mdCell("`x`") === "\\`x\\`");
+// code() is for values inside a backtick code span — it STRIPS backticks (escaping won't help there).
+check("code() strips backticks (no span breakout)", !code("a`b`c").includes("`"));
+check("code() leaves a plain host intact", code("mx1.example.com") === "mx1.example.com");
+// render-level guard: a malicious finding title cannot emit an active image into the summary/comment.
+check("renderSummary defangs a malicious finding title", !renderSummary([
+  { domain: "evil.test", summary: { critical: 0, high: 0, medium: 1, low: 0, pass: 0 },
+    findings: [{ severity: "medium", area: "SPF", title: "![beacon](https://evil.tld/x.png)", action: "fix" }] },
+], { passed: true, level: "advisory", reason: "advisory" }).includes("![beacon]"));
 
 console.log("== job-summary markdown ==");
 {

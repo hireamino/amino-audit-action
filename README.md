@@ -41,6 +41,13 @@ jobs:
 Audit several domains and comment on PRs:
 
 ```yaml
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write   # required ONLY for comment-on-pr
+    steps:
       - uses: your-org/amino-audit-action@v1
         with:
           domains: |
@@ -50,6 +57,8 @@ Audit several domains and comment on PRs:
           comment-on-pr: true
           github-token: ${{ github.token }}
 ```
+
+> **Note:** `comment-on-pr` needs `pull-requests: write` (shown above) — grant it only on the jobs that use the feature. Pull requests opened from **forks** receive a read-only token, so the comment is skipped there (the build still runs and the job summary is always written). The default token is otherwise read-only.
 
 ## Inputs
 
