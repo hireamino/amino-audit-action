@@ -93,20 +93,9 @@ Start with `advisory` to see what the audit reports with zero risk, then ratchet
 
 ## Example job summary
 
-The action writes a rich summary to the run's **Summary** tab:
+The action writes a rich summary to the run's **Summary** tab — here's the live result for `hireamino.com`:
 
-> ## Amino Email Deliverability Audit
-> ✅ **PASS** — `fail-on: advisory`. Advisory mode: never fails the build (worst seen: medium).
->
-> ### `example.com` — ⚠️ minor gaps
-> **critical 0 · high 0 · medium 1 · low 4 · pass 4** · primary MX: `mx.example.com`
->
-> | Severity | Area | Issue | Fix |
-> | --- | --- | --- | --- |
-> | 🟨 medium | MTA-STS | No MTA-STS policy | Publish an MTA-STS policy |
-> | ⬜ low | DKIM | DKIM not found at common/provider selectors | Confirm or enable DKIM signing |
-
-_(screenshot placeholder — see the live render in your Actions → Summary tab)_
+![Amino Email Deliverability Audit job summary — verdict, severity counts, and the exact fix for every finding](docs/scorecard.png)
 
 ## Privacy
 
