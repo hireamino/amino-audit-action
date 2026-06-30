@@ -99,7 +99,7 @@ The action writes a rich summary to the run's **Summary** tab — here's the liv
 
 ## Privacy
 
-**Read-only. No secrets. Nothing leaves your runner except public DNS lookups** (DNS-over-HTTPS to `cloudflare-dns.com`) and a small number of public HTTPS fetches the engine makes for `mta-sts.txt` / `robots.txt` / RDAP — all of which are guarded against pointing at private/internal addresses. The action never touches your DNS, never sends mail, and needs no credentials. The only token it ever uses is the optional `github-token`, used solely to post the PR comment you asked for.
+**Read-only. No secrets. No data is ever sent to Amino.** Nothing leaves your runner except public DNS lookups (DNS-over-HTTPS to `cloudflare-dns.com`) and a small number of public HTTPS fetches the engine makes for `mta-sts.txt` / `robots.txt` / RDAP — all of which are guarded against pointing at private/internal addresses. The action never touches your DNS, never sends mail, and needs no credentials. The only token it ever uses is the optional `github-token`, used solely to post the PR comment you asked for — that stays entirely within your own GitHub. There is no telemetry, analytics, or callback to Amino of any kind.
 
 ## License
 
