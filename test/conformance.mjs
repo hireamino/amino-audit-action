@@ -40,5 +40,12 @@ const assert = (name, cond) => { ok = cond && ok; console.log((cond ? "PASS" : "
   assert("I11 -ALL: no 'no all mechanism'", !t.some((x) => x.includes("no `all` mechanism")));
   assert("I11 -ALL: SPF present", t.some((x) => x.includes("SPF present")));
 }
+{ // I10 — subdomain inherits org policy via RFC 9989 tree walk (no false "No DMARC")
+  const dns = { "_dmarc.example.co.uk": { TXT: ["v=DMARC1; p=reject; rua=mailto:d@example.co.uk"] } };
+  const F = (await auditDomain("send.example.co.uk", makeQ(dns))).findings;
+  const t = titles(F);
+  assert("I10 subdomain inherits enforced policy", t.some((x) => x.includes("DMARC enforced (inherited")));
+  assert("I10 no false 'No DMARC record'", !t.some((x) => x.includes("No DMARC record")));
+}
 console.log(ok ? "\nALL PASS" : "\nSOME FAILED");
 process.exit(ok ? 0 : 1);

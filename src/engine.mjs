@@ -150,9 +150,28 @@ async function firstTxt(name, prefix, q) {
   return null;
 }
 
+// A pragmatic subset of the Public Suffix List: registry suffixes where the
+// registrable domain is the last THREE labels, not two. Not exhaustive (the full PSL
+// is a ~200 KB data dependency); it fixes the cases that matter for same-org checks —
+// e.g. good.co.uk and evil.co.uk must read as DIFFERENT orgs, not both "co.uk".
+const PUBLIC_SUFFIX_2 = new Set([
+  "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "net.uk", "ltd.uk", "plc.uk", "sch.uk",
+  "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au",
+  "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz",
+  "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp", "ad.jp",
+  "co.za", "org.za", "gov.za", "ac.za",
+  "co.in", "net.in", "org.in", "gen.in", "firm.in", "ind.in",
+  "com.br", "net.br", "org.br", "gov.br",
+  "com.cn", "net.cn", "org.cn", "gov.cn", "ac.cn",
+  "co.kr", "or.kr", "com.mx", "com.sg", "com.hk", "com.tw",
+  "co.il", "com.tr", "co.id", "com.my", "co.th", "or.th",
+]);
+
 function orgBase(host) {
-  const labels = host.replace(/\.+$/, "").toLowerCase().split(".");
-  return labels.length >= 2 ? labels.slice(-2).join(".") : host.replace(/\.+$/, "").toLowerCase();
+  const labels = host.replace(/\.+$/, "").toLowerCase().split(".").filter(Boolean);
+  if (labels.length <= 2) return labels.join(".");
+  const lastTwo = labels.slice(-2).join(".");
+  return (PUBLIC_SUFFIX_2.has(lastTwo) ? labels.slice(-3) : labels.slice(-2)).join(".");
 }
 
 async function isVoid(name, q) {
@@ -449,26 +468,63 @@ async function checkDkim(domain, F, q) {
 
 // ── DMARC ────────────────────────────────────────────────────────────────────
 
+// RFC 9989 (DMARCbis) tree walk: the applicable DMARC record is the domain's own
+// _dmarc if present, otherwise the nearest ancestor's, walking up to the organizational
+// domain (bounded to 5 lookups). A subdomain with no record of its own inherits the
+// ancestor's sp (subdomain policy) if set, else its p.
+async function discoverDmarc(domain, q) {
+  domain = domain.replace(/\.+$/, "").toLowerCase();
+  const own = await firstTxt("_dmarc." + domain, "v=dmarc1", q);
+  if (own) return { rec: own, source: domain, inherited: false };
+  const base = orgBase(domain);
+  const labels = domain.split(".");
+  for (let i = 1; i <= labels.length - 2 && i <= 5; i++) {
+    const parent = labels.slice(i).join(".");
+    const rec = await firstTxt("_dmarc." + parent, "v=dmarc1", q);
+    if (rec) return { rec, source: parent, inherited: true };
+    if (parent === base) break; // don't walk above the organizational domain
+  }
+  return { rec: null, source: null, inherited: false };
+}
+
 async function checkDmarc(domain, F, q) {
-  const rec = await firstTxt("_dmarc." + domain, "v=dmarc1", q);
+  const disc = await discoverDmarc(domain, q);
+  const rec = disc.rec;
   if (!rec) {
     F.push({ area: "DMARC", severity: "critical", title: "No DMARC record",
       detail: "No policy at _dmarc. Receivers have no instruction on how to handle unauthenticated mail in your name — and as of 2024-25, Gmail/Yahoo/Microsoft require DMARC for bulk senders. This is both a spoofing exposure and a hard deliverability blocker.",
       fix: 'Publish TXT at _dmarc: start with "v=DMARC1; p=none; rua=mailto:dmarc@<domain>" to collect reports, then ramp to p=quarantine and p=reject.' });
     return;
   }
-  const dmarcRecords = (await q("_dmarc." + domain, "TXT")).filter((r) => r.toLowerCase().startsWith("v=dmarc1"));
+  const kv = {};
+  for (const m of rec.matchAll(/(\w+)=\s*([^;]+)/g)) kv[m[1].toLowerCase()] = m[2];
+  const p = (kv.p || "").trim().toLowerCase();
+  const sp = (kv.sp || "").trim().toLowerCase();
+  const VALID_POLICY = new Set(["none", "quarantine", "reject"]);
+
+  if (disc.inherited) {
+    // No _dmarc at this subdomain: it inherits the org domain's policy — the sp
+    // (subdomain policy) tag if set, otherwise p (RFC 9989 tree walk).
+    const eff = sp || p;
+    const src = disc.source;
+    if (!VALID_POLICY.has(eff) || eff === "none") {
+      F.push({ area: "DMARC", severity: "high", title: "DMARC subdomain not enforced (inherited " + (sp ? "sp" : "p") + "=" + (eff || "<missing>") + " from " + src + ")",
+        detail: "This subdomain has no _dmarc record; it inherits " + src + "'s policy, which resolves to " + (eff || "<missing>") + " — spoofed mail from this subdomain isn't stopped.",
+        fix: "Publish _dmarc." + domain + " with p=reject, or set sp=reject on " + src + "." });
+    } else {
+      F.push({ area: "DMARC", severity: "pass", title: "DMARC enforced (inherited " + (sp ? "sp" : "p") + "=" + eff + " from " + src + ")",
+        detail: "This subdomain has no record of its own and is covered by " + src + "'s enforced policy.", fix: null, record: rec });
+    }
+    return;
+  }
+
+  const dmarcRecords = (await q("_dmarc." + disc.source, "TXT")).filter((r) => r.toLowerCase().startsWith("v=dmarc1"));
   if (dmarcRecords.length > 1) {
     F.push({ area: "DMARC", severity: "high", title: "Multiple DMARC records (invalid)",
       detail: dmarcRecords.length + " DMARC records exist at _dmarc. Exactly one is allowed — receivers ignore the policy entirely when there are several, so you effectively have no DMARC.",
       fix: "Keep one DMARC record and remove the rest." });
   }
-  const kv = {};
-  for (const m of rec.matchAll(/(\w+)=\s*([^;]+)/g)) kv[m[1].toLowerCase()] = m[2];
-  const p = (kv.p || "").trim().toLowerCase();
-  const sp = (kv.sp || "").trim().toLowerCase();
   const rua = "rua" in kv;
-  const VALID_POLICY = new Set(["none", "quarantine", "reject"]);
   if (!VALID_POLICY.has(p)) {
     F.push({ area: "DMARC", severity: "high", title: "DMARC policy value is invalid (p=" + (p || "<missing>") + ")",
       detail: "The p= tag must be exactly none, quarantine, or reject (RFC 9989). An unrecognized or missing value means receivers apply no enforcement — you have a DMARC record but no effective policy.",
