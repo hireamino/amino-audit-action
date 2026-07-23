@@ -108,6 +108,7 @@ async function mapPool(items, limit, fn) {
 
 function makeResolver() {
   const cache = new Map();
+  const metaCache = new Map(); // "type name" -> { status, ad, error }
   async function raw(name, rrtype) {
     const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${rrtype}`;
     let json;
@@ -116,11 +117,15 @@ function makeResolver() {
         headers: { accept: "application/dns-json" },
         signal: AbortSignal.timeout(5000),
       });
-      if (!res.ok) return [];
+      if (!res.ok) { metaCache.set(rrtype + " " + name, { status: null, ad: false, error: true }); return []; }
       json = await res.json();
     } catch (e) {
+      metaCache.set(rrtype + " " + name, { status: null, ad: false, error: true });
       return [];
     }
+    // Surface DoH Status (RCODE: 0 NOERROR, 2 SERVFAIL, 3 NXDOMAIN, 5 REFUSED) and the AD
+    // (Authenticated Data = DNSSEC-validated) bit for the DNSSEC/DANE/reliability checks.
+    metaCache.set(rrtype + " " + name, { status: json.Status ?? null, ad: !!json.AD, error: false });
     const want = RR[rrtype];
     const rows = (json.Answer || []).filter((a) => a.type === want).map((a) => a.data);
     if (rrtype === "TXT") {
@@ -137,6 +142,11 @@ function makeResolver() {
     if (!cache.has(k)) cache.set(k, raw(name, rrtype));
     return cache.get(k);
   }
+  // DNSSEC/rcode meta for a lookup: { status, ad, error }. Ensures the lookup ran first.
+  query.meta = async (name, rrtype) => {
+    await query(name, rrtype);
+    return metaCache.get(rrtype + " " + name) || { status: null, ad: false, error: true };
+  };
   return query;
 }
 
@@ -714,15 +724,23 @@ async function checkTransport(domain, F, q) {
     const pa = a.split(/\s+/)[0], pb = b.split(/\s+/)[0];
     return (/^\d+$/.test(pa) ? +pa : 99) - (/^\d+$/.test(pb) ? +pb : 99);
   })[0].split(/\s+/).pop().replace(/\.+$/, "");
-  const dane = await q("_25._tcp." + host, "TLSA");
+  const daneName = "_25._tcp." + host;
+  const dane = await q(daneName, "TLSA");
+  const daneMeta = q.meta ? await q.meta(daneName, "TLSA") : null;
   if (dane.length) {
     const bad = badTlsa(dane);
     if (bad) {
       F.push({ area: "Transport", severity: "medium", title: "DANE/TLSA present but misconfigured",
         detail: "TLSA records exist but " + bad + " For SMTP DANE only usage 3 (DANE-EE) or 2 (DANE-TA) are valid, and matching-type 1 (SHA-256) is recommended; an invalid record can break DANE-enforcing senders.",
         fix: "Correct the TLSA usage/selector/matching-type (typically '3 1 1' for the MX cert) and re-publish." });
+    } else if (daneMeta && daneMeta.ad === false) {
+      // TLSA present but the answer isn't DNSSEC-authenticated — DANE REQUIRES a validated
+      // chain (RFC 7672), so an unsigned TLSA is not active protection.
+      F.push({ area: "Transport", severity: "medium", title: "DANE/TLSA present but not DNSSEC-validated",
+        detail: "TLSA records exist but the response isn't DNSSEC-authenticated (AD bit not set). DANE requires a validated DNSSEC chain — without it senders can't trust the TLSA, so DANE gives no protection and can't be enforced.",
+        fix: "Enable DNSSEC on the zone so the TLSA records are cryptographically validated." });
     } else {
-      F.push({ area: "Transport", severity: "pass", title: "DANE/TLSA present", detail: "TLSA records bind the MX cert (requires DNSSEC).", fix: null });
+      F.push({ area: "Transport", severity: "pass", title: "DANE/TLSA present", detail: "TLSA records bind the MX cert" + (daneMeta && daneMeta.ad ? " (DNSSEC-validated)." : "."), fix: null });
     }
   } else {
     F.push({ area: "Transport", severity: "low", title: "No DANE/TLSA",
@@ -754,12 +772,18 @@ async function checkMxHygiene(domain, F, q) {
 
 async function checkDnssec(domain, F, q) {
   const keys = await q(domain, "DNSKEY");
-  if (keys.length) {
+  const meta = q.meta ? await q.meta(domain, "DNSKEY") : null;
+  // The AD (Authenticated Data) bit from a validating resolver is authoritative and
+  // respects the zone cut — a validated NODATA inside a signed parent still sets AD, so
+  // a subdomain isn't mis-reported as unsigned. Fall back to DNSKEY presence only when
+  // meta isn't available (non-DoH resolver / mock).
+  const signed = meta ? meta.ad : keys.length > 0;
+  if (signed) {
     F.push({ area: "DNSSEC", severity: "pass", title: "DNSSEC enabled",
-      detail: "The zone is DNSSEC-signed.", fix: null });
+      detail: "The zone is DNSSEC-signed and answers validate.", fix: null });
   } else {
     F.push({ area: "DNSSEC", severity: "low", title: "DNSSEC not enabled",
-      detail: "The zone publishes no DNSKEY, so DNS answers for this domain aren't cryptographically signed — and DANE can't be used without it. A trust/security gap more than a deliverability one.",
+      detail: "DNS answers for this domain aren't cryptographically signed/validated — and DANE can't be used without it. A trust/security gap more than a deliverability one.",
       fix: "Enable DNSSEC at your DNS provider (it's also the prerequisite for DANE)." });
   }
 }
