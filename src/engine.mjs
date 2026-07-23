@@ -389,6 +389,31 @@ function b64ByteLen(s) {
   try { return atob(s.replace(/\s+/g, "")).length; } catch { return -1; }
 }
 
+// Real RSA modulus bit-length from a DKIM p= (base64 SubjectPublicKeyInfo DER), or null
+// if it can't be parsed — more accurate than estimating from the base64 length. Pure
+// atob + manual DER walk so it works on Node AND the Cloudflare Workers runtime.
+function rsaModulusBits(b64) {
+  let bytes;
+  try { bytes = Uint8Array.from(atob(b64.replace(/\s+/g, "")), (c) => c.charCodeAt(0)); }
+  catch { return null; }
+  let i = 0;
+  const readLen = () => {
+    let n = bytes[i++];
+    if (n & 0x80) { let k = n & 0x7f; n = 0; while (k-- > 0) n = (n << 8) | bytes[i++]; }
+    return n;
+  };
+  const expect = (tag) => { if (bytes[i++] !== tag) throw new Error("der"); return readLen(); };
+  try {
+    expect(0x30);                              // SubjectPublicKeyInfo SEQUENCE
+    const algLen = expect(0x30); i += algLen;  // skip AlgorithmIdentifier
+    expect(0x03); i += 1;                       // BIT STRING, skip the unused-bits byte
+    expect(0x30);                              // RSAPublicKey SEQUENCE
+    let len = expect(0x02);                     // modulus INTEGER
+    if (bytes[i] === 0x00) len -= 1;            // strip a leading sign byte
+    return len > 0 ? len * 8 : null;
+  } catch { return null; }
+}
+
 function parseDkim(rec) {
   const kv = {};
   for (const m of rec.matchAll(/(\w+)=([^;]+)/g)) kv[m[1].toLowerCase()] = m[2];
@@ -400,8 +425,8 @@ function parseDkim(rec) {
   if (pub === "") return { ktype, pub, bits: null, testing, valid: false, reason: "revoked" };
   let bits = null, valid = true, reason = null;
   if (ktype === "rsa") {
-    const approx = Math.floor((pub.length * 3) / 4);
-    bits = approx < 200 ? 1024 : approx < 400 ? 2048 : 4096;
+    bits = rsaModulusBits(pub); // real modulus …
+    if (bits === null) { const approx = Math.floor((pub.length * 3) / 4); bits = approx < 200 ? 1024 : approx < 400 ? 2048 : 4096; } // … or estimate if unparseable
   } else if (ktype === "ed25519") {
     // Ed25519 public keys are exactly 32 bytes; anything else is malformed.
     if (b64ByteLen(pub) !== 32) { valid = false; reason = "malformed-ed25519"; }
@@ -442,7 +467,7 @@ async function dkimLookup(domain, q) {
         : "DKIM " + cands[i] + " malformed (" + reason + ")");
       continue;
     }
-    if (ktype === "rsa" && bits === 1024) { weak = weak || ("DKIM " + cands[i] + "=RSA-1024"); weakTesting = weakTesting || testing; continue; }
+    if (ktype === "rsa" && bits && bits < 2048) { weak = weak || ("DKIM " + cands[i] + "=RSA-" + bits); weakTesting = weakTesting || testing; continue; }
     const label = ktype.toUpperCase() + (bits ? "-" + bits : "");
     return ["good", "DKIM " + cands[i] + " (" + label + ")", testing];
   }
