@@ -232,7 +232,12 @@ function mxPatternMatches(pattern, host) {
   pattern = pattern.trim().replace(/\.+$/, "").toLowerCase();
   host = host.replace(/\.+$/, "").toLowerCase();
   if (pattern.startsWith("*.")) {
-    return host.endsWith(pattern.slice(1)) && (host.split(".").length - 1) >= (pattern.split(".").length - 1);
+    // RFC 8461 §4.1: a wildcard matches exactly ONE leftmost label — *.example.com
+    // matches mx.example.com but NOT a.b.example.com or example.com itself.
+    const suffix = pattern.slice(1); // ".example.com"
+    if (!host.endsWith(suffix)) return false;
+    const left = host.slice(0, host.length - suffix.length);
+    return left.length > 0 && !left.includes(".");
   }
   return pattern === host;
 }
@@ -255,7 +260,7 @@ async function mxProviders(domain, q) {
 // ── SPF ──────────────────────────────────────────────────────────────────────
 
 function spfQualifier(spf) {
-  const m = spf.match(/([-~?+]?)all\b/);
+  const m = spf.match(/([-~?+]?)all\b/i); // qualifiers are case-insensitive: -ALL == -all
   return !m ? null : (m[1] || "+");
 }
 
@@ -351,19 +356,28 @@ async function checkSpf(domain, F, q) {
 
 // ── DKIM ─────────────────────────────────────────────────────────────────────
 
+function b64ByteLen(s) {
+  try { return atob(s.replace(/\s+/g, "")).length; } catch { return -1; }
+}
+
 function parseDkim(rec) {
   const kv = {};
-  for (const m of rec.matchAll(/(\w+)=([^;]+)/g)) kv[m[1]] = m[2];
+  for (const m of rec.matchAll(/(\w+)=([^;]+)/g)) kv[m[1].toLowerCase()] = m[2];
   const ktype = (kv.k || "rsa").trim().toLowerCase();
   const pub = (kv.p || "").trim();
   const flags = (kv.t || "").trim().toLowerCase();
   const testing = flags ? flags.split(":").map((x) => x.trim()).includes("y") : false;
-  let bits = null;
-  if (ktype === "rsa" && pub) {
+  // An empty p= is a REVOKED selector (RFC 6376 §3.6.1) — never a healthy key.
+  if (pub === "") return { ktype, pub, bits: null, testing, valid: false, reason: "revoked" };
+  let bits = null, valid = true, reason = null;
+  if (ktype === "rsa") {
     const approx = Math.floor((pub.length * 3) / 4);
     bits = approx < 200 ? 1024 : approx < 400 ? 2048 : 4096;
+  } else if (ktype === "ed25519") {
+    // Ed25519 public keys are exactly 32 bytes; anything else is malformed.
+    if (b64ByteLen(pub) !== 32) { valid = false; reason = "malformed-ed25519"; }
   }
-  return { ktype, pub, bits, testing };
+  return { ktype, pub, bits, testing, valid, reason };
 }
 
 async function dkimCandidates(domain, q) {
@@ -386,16 +400,26 @@ async function dkimProbe(domain, sel, q) {
 async function dkimLookup(domain, q) {
   const cands = await dkimCandidates(domain, q);
   const recs = await mapPool(cands, MAX_DKIM_CONCURRENCY, (s) => dkimProbe(domain, s, q));
-  let weak = null, weakTesting = false;
+  let weak = null, weakTesting = false, invalid = null;
   for (let i = 0; i < cands.length; i++) {
     const rec = recs[i];
     if (!rec) continue;
-    const { ktype, bits, testing } = parseDkim(rec);
+    const { ktype, bits, testing, valid, reason } = parseDkim(rec);
+    if (valid === false) {
+      // Revoked/malformed key here. A healthy sibling selector still wins, so record
+      // it and keep scanning; surface it only if nothing better turns up.
+      invalid = invalid || (reason === "revoked"
+        ? "DKIM " + cands[i] + " revoked (empty p=)"
+        : "DKIM " + cands[i] + " malformed (" + reason + ")");
+      continue;
+    }
     if (ktype === "rsa" && bits === 1024) { weak = weak || ("DKIM " + cands[i] + "=RSA-1024"); weakTesting = weakTesting || testing; continue; }
     const label = ktype.toUpperCase() + (bits ? "-" + bits : "");
     return ["good", "DKIM " + cands[i] + " (" + label + ")", testing];
   }
-  return weak ? ["weak", weak, weakTesting] : ["unknown", "no DKIM key at common/provider selectors", false];
+  if (weak) return ["weak", weak, weakTesting];
+  if (invalid) return ["invalid", invalid, false];
+  return ["unknown", "no DKIM key at common/provider selectors", false];
 }
 
 async function checkDkim(domain, F, q) {
@@ -407,6 +431,10 @@ async function checkDkim(domain, F, q) {
     F.push({ area: "DKIM", severity: "high", title: "DKIM key is RSA-1024 (legacy)",
       detail: "RSA-1024 is below current strength guidance and is being phased out; some receivers discount it, and it's the first thing a PQC/crypto-hygiene review flags.",
       fix: "Rotate the selector to RSA-2048 (or Ed25519): publish the new key, let it propagate, then switch signing over.", record: note });
+  } else if (state === "invalid") {
+    F.push({ area: "DKIM", severity: "high", title: "DKIM key is revoked or malformed",
+      detail: "A DKIM record is published but the key is unusable (" + note + "). A revoked (empty p=) or malformed key can't verify signatures — receivers treat the mail as unsigned, so DKIM gives no protection.",
+      fix: "Publish a valid key at this selector (RSA >=2048 or Ed25519), or remove the dead record and sign from a live selector.", record: note });
   } else {
     F.push({ area: "DKIM", severity: "low", title: "DKIM not found at common/provider selectors",
       detail: "No DKIM key at the selectors probed. DKIM has no discovery mechanism, so this is a blind spot — the domain may well sign with a custom selector. Verify against actual message headers before concluding DKIM is absent; don't treat this as a confirmed gap.",
@@ -436,11 +464,16 @@ async function checkDmarc(domain, F, q) {
       fix: "Keep one DMARC record and remove the rest." });
   }
   const kv = {};
-  for (const m of rec.matchAll(/(\w+)=\s*([^;]+)/g)) kv[m[1]] = m[2];
-  const p = (kv.p || "none").trim().toLowerCase();
+  for (const m of rec.matchAll(/(\w+)=\s*([^;]+)/g)) kv[m[1].toLowerCase()] = m[2];
+  const p = (kv.p || "").trim().toLowerCase();
   const sp = (kv.sp || "").trim().toLowerCase();
   const rua = "rua" in kv;
-  if (p === "none") {
+  const VALID_POLICY = new Set(["none", "quarantine", "reject"]);
+  if (!VALID_POLICY.has(p)) {
+    F.push({ area: "DMARC", severity: "high", title: "DMARC policy value is invalid (p=" + (p || "<missing>") + ")",
+      detail: "The p= tag must be exactly none, quarantine, or reject (RFC 9989). An unrecognized or missing value means receivers apply no enforcement — you have a DMARC record but no effective policy.",
+      fix: "Set p= to none (monitor), quarantine, or reject." });
+  } else if (p === "none") {
     F.push({ area: "DMARC", severity: "high", title: "DMARC policy is p=none (monitor only)",
       detail: "p=none means spoofed mail is still delivered. It's a valid starting point but offers no protection at rest; mailbox providers increasingly treat enforced policies as a trust signal.",
       fix: "After reviewing aggregate reports, ramp to p=quarantine then p=reject (optionally with pct= staging)." });

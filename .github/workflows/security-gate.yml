@@ -44,3 +44,6 @@ jobs:
 
       - name: Run local test harness
         run: node test/local.mjs
+
+      - name: Run conformance checks (correctness spec)
+        run: node test/conformance.mjs
