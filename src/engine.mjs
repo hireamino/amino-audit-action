@@ -1038,7 +1038,22 @@ export async function auditDomain(domain, q) {
   }
   const summary = {};
   for (const s of ["critical", "high", "medium", "low", "pass"]) summary[s] = F.filter((f) => f.severity === s).length;
-  return { domain, primary_mx: mxHost, summary, findings: F };
+  // I20: if a CRITICAL lookup (SPF/DMARC/MX) hit a transient failure (SERVFAIL/REFUSED or
+  // a fetch error) the audit is inconclusive — those verdicts can't be trusted as "absent".
+  // Distinct from NXDOMAIN(3)/NODATA(0), which are conclusive. The Action folds this into
+  // audit-complete; other surfaces expose it for downstream consumers.
+  let inconclusive = false, inconclusiveReason = null;
+  if (typeof q === "function" && q.meta) {
+    for (const [n, t] of [[domain, "TXT"], ["_dmarc." + domain, "TXT"], [domain, "MX"]]) {
+      const m = await q.meta(n, t);
+      if (m.error || m.status === 2 || m.status === 5) {
+        inconclusive = true;
+        inconclusiveReason = t + " " + n + ": " + (m.error ? "lookup error" : "SERVFAIL/REFUSED");
+        break;
+      }
+    }
+  }
+  return { domain, primary_mx: mxHost, summary, findings: F, inconclusive, inconclusive_reason: inconclusiveReason };
 }
 
 // batch_score.py parity surface — the DNS-only, edge-safe Y/N buckets + gap.

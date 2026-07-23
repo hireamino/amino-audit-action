@@ -160,6 +160,27 @@ console.log("== I19/I20: inconclusive audit + strict input (finalize) ==");
   check("I19 empty input → no domains", parseDomains("").length === 0 && parseDomains(" , ;; @@ ").length === 0);
 }
 
+console.log("== I20-resolver: transient DNS on a critical lookup → inconclusive ==");
+{
+  // Mock resolver: no records, meta reports the given rcode for _dmarc's TXT lookup.
+  const metaQ = (statusForDmarc) => {
+    const q = async () => [];
+    q.meta = async (name, type) =>
+      (name === "_dmarc.x.com" && type === "TXT")
+        ? { status: statusForDmarc, ad: false, error: false }
+        : { status: 0, ad: false, error: false };
+    return q;
+  };
+  const servfail = await auditDomain("x.com", metaQ(2)); // 2 = SERVFAIL
+  check("I20 SERVFAIL on a critical lookup → inconclusive", servfail.inconclusive === true);
+  const nxdomain = await auditDomain("x.com", metaQ(3)); // 3 = NXDOMAIN is conclusive
+  check("I20 NXDOMAIN is conclusive → not inconclusive", nxdomain.inconclusive === false);
+  const dec = finalize([servfail], "advisory", true);
+  check("I20 inconclusive audit → audit-complete=false", dec.auditComplete === false && dec.passed === false);
+  check("I20 inconclusive lenient default → build not failed", dec.failBuild === false);
+  check("I20 inconclusive + continue-on-audit-error=false → build fails", finalize([servfail], "advisory", false).failBuild === true);
+}
+
 console.log("== summaryOutput JSON ==");
 {
   const out = JSON.parse(summaryOutput([mkResult("a.com", ["high", "pass"])]));

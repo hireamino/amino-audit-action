@@ -103,7 +103,9 @@ function advisoryReason(worst) {
 // always-fatal config error handled in run().)
 export function finalize(results, failOn, continueOnAuditError = true) {
   const base = decide(results, failOn);
-  const inconclusive = results.filter((r) => r.error).map((r) => r.domain);
+  // A domain is inconclusive if the engine threw (r.error) OR a critical lookup hit a
+  // transient DNS failure (r.inconclusive, set by auditDomain from the resolver meta).
+  const inconclusive = results.filter((r) => r.error || r.inconclusive).map((r) => r.domain);
   const auditComplete = inconclusive.length === 0;
   const passed = base.passed && auditComplete;
   const failBuild = !base.passed || (!auditComplete && !continueOnAuditError);
