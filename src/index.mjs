@@ -93,6 +93,32 @@ function advisoryReason(worst) {
     : "Advisory mode: never fails the build (no issues found).";
 }
 
+// Final build decision, layered on decide() to fold in audit COMPLETENESS.
+// Policy ("strict input, lenient transient"): a domain the engine couldn't
+// conclusively audit (it threw) is "inconclusive" — that sets passed=false and
+// audit-complete=false so a downstream step can react, but by default it does NOT
+// fail the build. It fails the build only when the user opts in with
+// continue-on-audit-error=false. Findings crossing the fail-on threshold fail the
+// build exactly as decide() already dictates. (Empty/invalid input is a separate,
+// always-fatal config error handled in run().)
+export function finalize(results, failOn, continueOnAuditError = true) {
+  const base = decide(results, failOn);
+  const inconclusive = results.filter((r) => r.error).map((r) => r.domain);
+  const auditComplete = inconclusive.length === 0;
+  const passed = base.passed && auditComplete;
+  const failBuild = !base.passed || (!auditComplete && !continueOnAuditError);
+  let reason = base.reason;
+  if (!auditComplete) {
+    const tail = !base.passed
+      ? ""
+      : continueOnAuditError
+        ? " Not failing the build (continue-on-audit-error=true), but audit-complete=false and passed=false."
+        : " Failing the build (continue-on-audit-error=false).";
+    reason = `${base.reason} ${inconclusive.length} domain(s) could not be conclusively audited (${inconclusive.join(", ")}).${tail}`;
+  }
+  return { passed, worst: base.worst, level: base.level, auditComplete, failBuild, inconclusive, reason };
+}
+
 // ── Markdown rendering ────────────────────────────────────────────────────────
 
 // Defang an attacker-influenced string for safe inclusion as PLAIN markdown text
@@ -137,7 +163,8 @@ export function renderSummary(results, decision) {
   const lines = [];
   lines.push("## Amino Email Deliverability Audit");
   lines.push("");
-  const badge = decision.passed ? "✅ **PASS**" : "❌ **FAIL**";
+  const failBuild = decision.failBuild ?? !decision.passed;
+  const badge = failBuild ? "❌ **FAIL**" : decision.auditComplete === false ? "⚠️ **INCOMPLETE**" : "✅ **PASS**";
   lines.push(`${badge} — \`fail-on: ${decision.level}\`. ${decision.reason}`);
   lines.push("");
 
@@ -186,7 +213,9 @@ export function renderConsole(results, decision) {
       `  ${r.domain}: critical=${s.critical || 0} high=${s.high || 0} medium=${s.medium || 0} low=${s.low || 0} pass=${s.pass || 0}`
     );
   }
-  lines.push(`  verdict: ${decision.passed ? "PASS" : "FAIL"} (fail-on=${decision.level}, worst=${decision.worst || "none"})`);
+  const failBuild = decision.failBuild ?? !decision.passed;
+  const verdict = failBuild ? "FAIL" : decision.auditComplete === false ? "INCOMPLETE" : "PASS";
+  lines.push(`  verdict: ${verdict} (fail-on=${decision.level}, worst=${decision.worst || "none"}${decision.auditComplete === false ? ", audit-complete=false" : ""})`);
   return lines.join("\n");
 }
 
@@ -274,16 +303,22 @@ export async function run() {
   const domains = parseDomains(readInput("domains"));
   const failOn = normalizeFailOn(readInput("fail-on"));
   const commentOnPr = String(readInput("comment-on-pr")).trim().toLowerCase() === "true";
+  // Default true: transient/inconclusive audits don't hard-fail CI. Set to "false" to
+  // make any domain that couldn't be conclusively audited fail the build.
+  const continueOnAuditError = String(readInput("continue-on-audit-error")).trim().toLowerCase() !== "false";
   const token = readInput("github-token");
 
   if (!domains.length) {
-    const md = "## Amino Email Deliverability Audit\n\n⚠️ No valid domains were provided in the `domains` input.";
+    // Strict input: an empty/invalid `domains` input is a misconfiguration, not a
+    // clean audit — always exit non-zero so a required check can't silently pass.
+    const md = "## Amino Email Deliverability Audit\n\n❌ **FAIL** — no valid domains were provided in the `domains` input. This is a configuration error; nothing was audited.";
     await writeSummary(md);
-    console.log("No valid domains provided. Nothing to audit.");
-    await setOutput("passed", "true");
+    console.error("No valid domains provided in `domains` input — configuration error, nothing to audit.");
+    await setOutput("passed", "false");
+    await setOutput("audit-complete", "false");
     await setOutput("worst-severity", "none");
     await setOutput("summary", "[]");
-    process.exit(0);
+    process.exit(1);
     return;
   }
 
@@ -295,7 +330,8 @@ export async function run() {
       const r = await auditDomain(domain);
       results.push(r);
     } catch (e) {
-      // One bad domain must not abort the run — record an error "finding".
+      // One bad domain must not abort the run — record it as an inconclusive audit
+      // (finalize() folds this into audit-complete / passed).
       results.push({
         domain,
         primary_mx: null,
@@ -306,7 +342,7 @@ export async function run() {
     }
   }
 
-  const decision = decide(results, failOn);
+  const decision = finalize(results, failOn, continueOnAuditError);
   const md = renderSummary(results, decision);
 
   await writeSummary(md);
@@ -314,12 +350,13 @@ export async function run() {
   console.log(decision.reason);
 
   await setOutput("passed", String(decision.passed));
+  await setOutput("audit-complete", String(decision.auditComplete));
   await setOutput("worst-severity", decision.worst || "none");
   await setOutput("summary", summaryOutput(results));
 
   if (commentOnPr) await maybeCommentOnPr(md, token);
 
-  process.exit(decision.passed ? 0 : 1);
+  process.exit(decision.failBuild ? 1 : 0);
 }
 
 // Only auto-run when invoked directly as the action entrypoint — not when this
