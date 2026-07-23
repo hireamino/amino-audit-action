@@ -2,7 +2,7 @@
 // Runs auditDomain() against canned DNS (mock resolver, no network) and asserts the
 // v1.2 batch-1 false-pass fixtures now produce the correct verdict. Exits non-zero on
 // any violation so it runs as a CI gate.
-import { auditDomain } from "../src/engine.mjs";
+import { auditDomain, mtaStsPolicyProblems } from "../src/engine.mjs";
 
 function makeQ(dns, dkimRec) {
   return async (name, type) => {
@@ -46,6 +46,18 @@ const assert = (name, cond) => { ok = cond && ok; console.log((cond ? "PASS" : "
   const t = titles(F);
   assert("I10 subdomain inherits enforced policy", t.some((x) => x.includes("DMARC enforced (inherited")));
   assert("I10 no false 'No DMARC record'", !t.some((x) => x.includes("No DMARC record")));
+}
+{ // I15 — MTA-STS strict field validation (RFC 8461)
+  assert("I15 valid enforce → no problems", mtaStsPolicyProblems("version: STSv1\nmode: enforce\nmax_age: 604800\nmx: mx.ex.com\n").problems.length === 0);
+  assert("I15 enforce missing fields → problems", mtaStsPolicyProblems("mode: enforce\n").problems.length > 0);
+  assert("I15 max_age out of range → problem", mtaStsPolicyProblems("version: STSv1\nmode: enforce\nmax_age: 99999999\nmx: a.ex.com").problems.some((p) => p.includes("max_age")));
+  assert("I15 mode none needs no mx", mtaStsPolicyProblems("version: STSv1\nmode: none\nmax_age: 100").problems.length === 0);
+}
+{ // I16 — TXT advertises a policy but it isn't fetchable (200 + text/plain) → not enforced
+  const F = (await auditDomain("ex.com", makeQ({ "_mta-sts.ex.com": { TXT: ["v=STSv1; id=1"] } }))).findings;
+  const t = titles(F);
+  assert("I16 unfetchable policy → flagged", t.some((x) => x.includes("policy file not retrievable")));
+  assert("I16 not reported present/enforced", !t.some((x) => x.includes("MTA-STS present")));
 }
 console.log(ok ? "\nALL PASS" : "\nSOME FAILED");
 process.exit(ok ? 0 : 1);

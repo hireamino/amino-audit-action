@@ -586,43 +586,66 @@ async function fetchMtaStsPolicy(domain, env, q) {
     const res = await fetch("https://mta-sts." + domain + "/.well-known/mta-sts.txt", {
       signal: AbortSignal.timeout(3000), redirect: "manual",
     });
-    if (!res.ok) return null;
+    // RFC 8461 §3.3: the policy MUST be served as HTTP 200 with Content-Type text/plain.
+    if (res.status !== 200) return null;
+    if (!(res.headers.get("content-type") || "").toLowerCase().includes("text/plain")) return null;
     return (await res.text()).slice(0, 8192);
   } catch (e) {
     return null;
   }
 }
 
+// RFC 8461 §3.2 policy validation. Returns { problems[], mode, maxAge, polMx }.
+// A well-formed policy has version: STSv1, a valid mode, an integer max_age in range,
+// and (unless mode: none) at least one mx:. Exported for conformance tests.
+export function mtaStsPolicyProblems(policy) {
+  const version = (policy.match(/^[ \t]*version:[ \t]*(\S+)/im) || [])[1];
+  const mode = ((policy.match(/^[ \t]*mode:[ \t]*(\w+)/im) || [])[1] || "").toLowerCase();
+  const maxAgeRaw = (policy.match(/^[ \t]*max_age:[ \t]*(\d+)/im) || [])[1];
+  const maxAge = maxAgeRaw === undefined ? null : parseInt(maxAgeRaw, 10);
+  const polMx = [...policy.matchAll(/^[ \t]*mx:[ \t]*(\S+)/gim)].map((m) => m[1]);
+  const problems = [];
+  if (!version || version.toLowerCase() !== "stsv1") problems.push("missing/invalid version (must be STSv1)");
+  if (!["enforce", "testing", "none"].includes(mode)) problems.push("missing/invalid mode");
+  if (maxAge === null || maxAge <= 0 || maxAge > 31557600) problems.push("missing/invalid max_age");
+  if (mode !== "none" && polMx.length === 0) problems.push("no mx entries");
+  return { problems, mode, maxAge, polMx };
+}
+
 async function checkMtaSts(domain, F, q) {
   const txt = await firstTxt("_mta-sts." + domain, "v=stsv1", q);
-  const policy = await fetchMtaStsPolicy(domain, null, q);
   if (!txt) {
     F.push({ area: "MTA-STS", severity: "medium", title: "No MTA-STS policy",
       detail: "MTA-STS lets you require TLS for inbound SMTP and is part of a modern transport posture (and a growing compliance ask under NIS2/gov mandates). Absent it, downgrade attacks on mail-in-transit are possible.",
       fix: "Publish _mta-sts TXT (v=STSv1; id=...) and host https://mta-sts.<domain>/.well-known/mta-sts.txt with mode: enforce." });
     return;
   }
-  const mm = (policy || "").match(/mode:\s*(\w+)/);
-  const mode = mm ? mm[1].toLowerCase() : "unknown";
+  const policy = await fetchMtaStsPolicy(domain, null, q);
+  if (!policy) {
+    F.push({ area: "MTA-STS", severity: "medium", title: "MTA-STS TXT present but policy file not retrievable",
+      detail: "The _mta-sts TXT record advertises a policy, but https://mta-sts." + domain + "/.well-known/mta-sts.txt did not return a valid policy (RFC 8461 requires HTTP 200 with Content-Type text/plain). Senders can't fetch it, so MTA-STS isn't actually enforced.",
+      fix: "Serve the policy at that URL over HTTPS with status 200 and Content-Type: text/plain." });
+    return;
+  }
+  const { problems, mode, polMx } = mtaStsPolicyProblems(policy);
+  if (problems.length) {
+    F.push({ area: "MTA-STS", severity: mode === "enforce" ? "high" : "medium", title: "MTA-STS policy is malformed",
+      detail: "The hosted policy is invalid (" + problems.join("; ") + "). RFC 8461 requires version: STSv1, a valid mode, an integer max_age, and at least one mx: (unless mode: none)." +
+        (mode === "enforce" ? " Under mode: enforce a malformed policy can break inbound mail delivery." : ""),
+      fix: "Fix the hosted mta-sts.txt to include version: STSv1, mode:, max_age:, and mx: lines per RFC 8461." });
+    return;
+  }
   F.push({ area: "MTA-STS", severity: mode === "enforce" ? "pass" : "medium", title: "MTA-STS present (mode: " + mode + ")",
     detail: "Policy published." + (mode === "enforce" ? "" : " mode is not 'enforce' — testing/none gives no real protection."),
     fix: mode === "enforce" ? null : "Move policy to mode: enforce once tested." });
-  if (policy) {
-    if (!/max_age:\s*(\d+)/.test(policy)) {
-      F.push({ area: "MTA-STS", severity: "low", title: "MTA-STS policy missing max_age",
-        detail: "The hosted policy has no max_age, so caching behavior is undefined and the policy may not 'stick' at senders.",
-        fix: "Add a max_age (e.g. max_age: 604800) to the hosted mta-sts.txt." });
-    }
-    const polMx = [...policy.matchAll(/mx:\s*(\S+)/g)].map((m) => m[1]);
-    const realMx = mxHosts(await q(domain, "MX"));
-    if (polMx.length && realMx.length) {
-      const unmatched = realMx.filter((h) => !polMx.some((p) => mxPatternMatches(p, h)));
-      if (unmatched.length) {
-        F.push({ area: "MTA-STS", severity: mode === "enforce" ? "high" : "medium", title: "MTA-STS policy does not cover all MX hosts",
-          detail: "These live MX hosts match no mx: line in the policy: " + unmatched.join(", ") + "." +
-            (mode === "enforce" ? " Under mode: enforce, senders will REFUSE to deliver to them — active mail loss." : " Once you move to enforce, mail to them will fail."),
-          fix: "Add the missing MX hostnames (or a *.<domain> wildcard) to the mx: lines in the hosted policy." });
-      }
+  const realMx = mxHosts(await q(domain, "MX"));
+  if (polMx.length && realMx.length) {
+    const unmatched = realMx.filter((h) => !polMx.some((p) => mxPatternMatches(p, h)));
+    if (unmatched.length) {
+      F.push({ area: "MTA-STS", severity: mode === "enforce" ? "high" : "medium", title: "MTA-STS policy does not cover all MX hosts",
+        detail: "These live MX hosts match no mx: line in the policy: " + unmatched.join(", ") + "." +
+          (mode === "enforce" ? " Under mode: enforce, senders will REFUSE to deliver to them — active mail loss." : " Once you move to enforce, mail to them will fail."),
+        fix: "Add the missing MX hostnames (or a *.<domain> wildcard) to the mx: lines in the hosted policy." });
     }
   }
 }
