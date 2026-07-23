@@ -44,3 +44,14 @@ jobs:
 
       - name: Run local test harness
         run: node test/local.mjs
+
+      - name: Run conformance checks (correctness spec)
+        run: node test/conformance.mjs
+
+      - name: Clone amino-skills (shared conformance corpus — public)
+        run: git clone --depth 1 https://github.com/hireamino/amino-skills.git /tmp/amino-skills
+
+      - name: Fixtures-driven conformance runner (shared corpus — hard gate)
+        env:
+          ENGINE: ${{ github.workspace }}/src/engine.mjs
+        run: node /tmp/amino-skills/conformance/run.mjs

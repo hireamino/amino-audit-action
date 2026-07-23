@@ -108,6 +108,7 @@ async function mapPool(items, limit, fn) {
 
 function makeResolver() {
   const cache = new Map();
+  const metaCache = new Map(); // "type name" -> { status, ad, error }
   async function raw(name, rrtype) {
     const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${rrtype}`;
     let json;
@@ -116,11 +117,15 @@ function makeResolver() {
         headers: { accept: "application/dns-json" },
         signal: AbortSignal.timeout(5000),
       });
-      if (!res.ok) return [];
+      if (!res.ok) { metaCache.set(rrtype + " " + name, { status: null, ad: false, error: true }); return []; }
       json = await res.json();
     } catch (e) {
+      metaCache.set(rrtype + " " + name, { status: null, ad: false, error: true });
       return [];
     }
+    // Surface DoH Status (RCODE: 0 NOERROR, 2 SERVFAIL, 3 NXDOMAIN, 5 REFUSED) and the AD
+    // (Authenticated Data = DNSSEC-validated) bit for the DNSSEC/DANE/reliability checks.
+    metaCache.set(rrtype + " " + name, { status: json.Status ?? null, ad: !!json.AD, error: false });
     const want = RR[rrtype];
     const rows = (json.Answer || []).filter((a) => a.type === want).map((a) => a.data);
     if (rrtype === "TXT") {
@@ -137,6 +142,11 @@ function makeResolver() {
     if (!cache.has(k)) cache.set(k, raw(name, rrtype));
     return cache.get(k);
   }
+  // DNSSEC/rcode meta for a lookup: { status, ad, error }. Ensures the lookup ran first.
+  query.meta = async (name, rrtype) => {
+    await query(name, rrtype);
+    return metaCache.get(rrtype + " " + name) || { status: null, ad: false, error: true };
+  };
   return query;
 }
 
@@ -150,9 +160,28 @@ async function firstTxt(name, prefix, q) {
   return null;
 }
 
+// A pragmatic subset of the Public Suffix List: registry suffixes where the
+// registrable domain is the last THREE labels, not two. Not exhaustive (the full PSL
+// is a ~200 KB data dependency); it fixes the cases that matter for same-org checks —
+// e.g. good.co.uk and evil.co.uk must read as DIFFERENT orgs, not both "co.uk".
+const PUBLIC_SUFFIX_2 = new Set([
+  "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "net.uk", "ltd.uk", "plc.uk", "sch.uk",
+  "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au",
+  "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz",
+  "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp", "ad.jp",
+  "co.za", "org.za", "gov.za", "ac.za",
+  "co.in", "net.in", "org.in", "gen.in", "firm.in", "ind.in",
+  "com.br", "net.br", "org.br", "gov.br",
+  "com.cn", "net.cn", "org.cn", "gov.cn", "ac.cn",
+  "co.kr", "or.kr", "com.mx", "com.sg", "com.hk", "com.tw",
+  "co.il", "com.tr", "co.id", "com.my", "co.th", "or.th",
+]);
+
 function orgBase(host) {
-  const labels = host.replace(/\.+$/, "").toLowerCase().split(".");
-  return labels.length >= 2 ? labels.slice(-2).join(".") : host.replace(/\.+$/, "").toLowerCase();
+  const labels = host.replace(/\.+$/, "").toLowerCase().split(".").filter(Boolean);
+  if (labels.length <= 2) return labels.join(".");
+  const lastTwo = labels.slice(-2).join(".");
+  return (PUBLIC_SUFFIX_2.has(lastTwo) ? labels.slice(-3) : labels.slice(-2)).join(".");
 }
 
 async function isVoid(name, q) {
@@ -232,7 +261,12 @@ function mxPatternMatches(pattern, host) {
   pattern = pattern.trim().replace(/\.+$/, "").toLowerCase();
   host = host.replace(/\.+$/, "").toLowerCase();
   if (pattern.startsWith("*.")) {
-    return host.endsWith(pattern.slice(1)) && (host.split(".").length - 1) >= (pattern.split(".").length - 1);
+    // RFC 8461 §4.1: a wildcard matches exactly ONE leftmost label — *.example.com
+    // matches mx.example.com but NOT a.b.example.com or example.com itself.
+    const suffix = pattern.slice(1); // ".example.com"
+    if (!host.endsWith(suffix)) return false;
+    const left = host.slice(0, host.length - suffix.length);
+    return left.length > 0 && !left.includes(".");
   }
   return pattern === host;
 }
@@ -255,7 +289,7 @@ async function mxProviders(domain, q) {
 // ── SPF ──────────────────────────────────────────────────────────────────────
 
 function spfQualifier(spf) {
-  const m = spf.match(/([-~?+]?)all\b/);
+  const m = spf.match(/([-~?+]?)all\b/i); // qualifiers are case-insensitive: -ALL == -all
   return !m ? null : (m[1] || "+");
 }
 
@@ -351,19 +385,53 @@ async function checkSpf(domain, F, q) {
 
 // ── DKIM ─────────────────────────────────────────────────────────────────────
 
+function b64ByteLen(s) {
+  try { return atob(s.replace(/\s+/g, "")).length; } catch { return -1; }
+}
+
+// Real RSA modulus bit-length from a DKIM p= (base64 SubjectPublicKeyInfo DER), or null
+// if it can't be parsed — more accurate than estimating from the base64 length. Pure
+// atob + manual DER walk so it works on Node AND the Cloudflare Workers runtime.
+function rsaModulusBits(b64) {
+  let bytes;
+  try { bytes = Uint8Array.from(atob(b64.replace(/\s+/g, "")), (c) => c.charCodeAt(0)); }
+  catch { return null; }
+  let i = 0;
+  const readLen = () => {
+    let n = bytes[i++];
+    if (n & 0x80) { let k = n & 0x7f; n = 0; while (k-- > 0) n = (n << 8) | bytes[i++]; }
+    return n;
+  };
+  const expect = (tag) => { if (bytes[i++] !== tag) throw new Error("der"); return readLen(); };
+  try {
+    expect(0x30);                              // SubjectPublicKeyInfo SEQUENCE
+    const algLen = expect(0x30); i += algLen;  // skip AlgorithmIdentifier
+    expect(0x03); i += 1;                       // BIT STRING, skip the unused-bits byte
+    expect(0x30);                              // RSAPublicKey SEQUENCE
+    let len = expect(0x02);                     // modulus INTEGER
+    if (bytes[i] === 0x00) len -= 1;            // strip a leading sign byte
+    return len > 0 ? len * 8 : null;
+  } catch { return null; }
+}
+
 function parseDkim(rec) {
   const kv = {};
-  for (const m of rec.matchAll(/(\w+)=([^;]+)/g)) kv[m[1]] = m[2];
+  for (const m of rec.matchAll(/(\w+)=([^;]+)/g)) kv[m[1].toLowerCase()] = m[2];
   const ktype = (kv.k || "rsa").trim().toLowerCase();
   const pub = (kv.p || "").trim();
   const flags = (kv.t || "").trim().toLowerCase();
   const testing = flags ? flags.split(":").map((x) => x.trim()).includes("y") : false;
-  let bits = null;
-  if (ktype === "rsa" && pub) {
-    const approx = Math.floor((pub.length * 3) / 4);
-    bits = approx < 200 ? 1024 : approx < 400 ? 2048 : 4096;
+  // An empty p= is a REVOKED selector (RFC 6376 §3.6.1) — never a healthy key.
+  if (pub === "") return { ktype, pub, bits: null, testing, valid: false, reason: "revoked" };
+  let bits = null, valid = true, reason = null;
+  if (ktype === "rsa") {
+    bits = rsaModulusBits(pub); // real modulus …
+    if (bits === null) { const approx = Math.floor((pub.length * 3) / 4); bits = approx < 200 ? 1024 : approx < 400 ? 2048 : 4096; } // … or estimate if unparseable
+  } else if (ktype === "ed25519") {
+    // Ed25519 public keys are exactly 32 bytes; anything else is malformed.
+    if (b64ByteLen(pub) !== 32) { valid = false; reason = "malformed-ed25519"; }
   }
-  return { ktype, pub, bits, testing };
+  return { ktype, pub, bits, testing, valid, reason };
 }
 
 async function dkimCandidates(domain, q) {
@@ -386,16 +454,26 @@ async function dkimProbe(domain, sel, q) {
 async function dkimLookup(domain, q) {
   const cands = await dkimCandidates(domain, q);
   const recs = await mapPool(cands, MAX_DKIM_CONCURRENCY, (s) => dkimProbe(domain, s, q));
-  let weak = null, weakTesting = false;
+  let weak = null, weakTesting = false, invalid = null;
   for (let i = 0; i < cands.length; i++) {
     const rec = recs[i];
     if (!rec) continue;
-    const { ktype, bits, testing } = parseDkim(rec);
-    if (ktype === "rsa" && bits === 1024) { weak = weak || ("DKIM " + cands[i] + "=RSA-1024"); weakTesting = weakTesting || testing; continue; }
+    const { ktype, bits, testing, valid, reason } = parseDkim(rec);
+    if (valid === false) {
+      // Revoked/malformed key here. A healthy sibling selector still wins, so record
+      // it and keep scanning; surface it only if nothing better turns up.
+      invalid = invalid || (reason === "revoked"
+        ? "DKIM " + cands[i] + " revoked (empty p=)"
+        : "DKIM " + cands[i] + " malformed (" + reason + ")");
+      continue;
+    }
+    if (ktype === "rsa" && bits && bits < 2048) { weak = weak || ("DKIM " + cands[i] + "=RSA-" + bits); weakTesting = weakTesting || testing; continue; }
     const label = ktype.toUpperCase() + (bits ? "-" + bits : "");
     return ["good", "DKIM " + cands[i] + " (" + label + ")", testing];
   }
-  return weak ? ["weak", weak, weakTesting] : ["unknown", "no DKIM key at common/provider selectors", false];
+  if (weak) return ["weak", weak, weakTesting];
+  if (invalid) return ["invalid", invalid, false];
+  return ["unknown", "no DKIM key at common/provider selectors", false];
 }
 
 async function checkDkim(domain, F, q) {
@@ -407,6 +485,10 @@ async function checkDkim(domain, F, q) {
     F.push({ area: "DKIM", severity: "high", title: "DKIM key is RSA-1024 (legacy)",
       detail: "RSA-1024 is below current strength guidance and is being phased out; some receivers discount it, and it's the first thing a PQC/crypto-hygiene review flags.",
       fix: "Rotate the selector to RSA-2048 (or Ed25519): publish the new key, let it propagate, then switch signing over.", record: note });
+  } else if (state === "invalid") {
+    F.push({ area: "DKIM", severity: "high", title: "DKIM key is revoked or malformed",
+      detail: "A DKIM record is published but the key is unusable (" + note + "). A revoked (empty p=) or malformed key can't verify signatures — receivers treat the mail as unsigned, so DKIM gives no protection.",
+      fix: "Publish a valid key at this selector (RSA >=2048 or Ed25519), or remove the dead record and sign from a live selector.", record: note });
   } else {
     F.push({ area: "DKIM", severity: "low", title: "DKIM not found at common/provider selectors",
       detail: "No DKIM key at the selectors probed. DKIM has no discovery mechanism, so this is a blind spot — the domain may well sign with a custom selector. Verify against actual message headers before concluding DKIM is absent; don't treat this as a confirmed gap.",
@@ -421,26 +503,68 @@ async function checkDkim(domain, F, q) {
 
 // ── DMARC ────────────────────────────────────────────────────────────────────
 
+// RFC 9989 (DMARCbis) tree walk: the applicable DMARC record is the domain's own
+// _dmarc if present, otherwise the nearest ancestor's, walking up to the organizational
+// domain (bounded to 5 lookups). A subdomain with no record of its own inherits the
+// ancestor's sp (subdomain policy) if set, else its p.
+async function discoverDmarc(domain, q) {
+  domain = domain.replace(/\.+$/, "").toLowerCase();
+  const own = await firstTxt("_dmarc." + domain, "v=dmarc1", q);
+  if (own) return { rec: own, source: domain, inherited: false };
+  const base = orgBase(domain);
+  const labels = domain.split(".");
+  for (let i = 1; i <= labels.length - 2 && i <= 5; i++) {
+    const parent = labels.slice(i).join(".");
+    const rec = await firstTxt("_dmarc." + parent, "v=dmarc1", q);
+    if (rec) return { rec, source: parent, inherited: true };
+    if (parent === base) break; // don't walk above the organizational domain
+  }
+  return { rec: null, source: null, inherited: false };
+}
+
 async function checkDmarc(domain, F, q) {
-  const rec = await firstTxt("_dmarc." + domain, "v=dmarc1", q);
+  const disc = await discoverDmarc(domain, q);
+  const rec = disc.rec;
   if (!rec) {
     F.push({ area: "DMARC", severity: "critical", title: "No DMARC record",
       detail: "No policy at _dmarc. Receivers have no instruction on how to handle unauthenticated mail in your name — and as of 2024-25, Gmail/Yahoo/Microsoft require DMARC for bulk senders. This is both a spoofing exposure and a hard deliverability blocker.",
       fix: 'Publish TXT at _dmarc: start with "v=DMARC1; p=none; rua=mailto:dmarc@<domain>" to collect reports, then ramp to p=quarantine and p=reject.' });
     return;
   }
-  const dmarcRecords = (await q("_dmarc." + domain, "TXT")).filter((r) => r.toLowerCase().startsWith("v=dmarc1"));
+  const kv = {};
+  for (const m of rec.matchAll(/(\w+)=\s*([^;]+)/g)) kv[m[1].toLowerCase()] = m[2];
+  const p = (kv.p || "").trim().toLowerCase();
+  const sp = (kv.sp || "").trim().toLowerCase();
+  const VALID_POLICY = new Set(["none", "quarantine", "reject"]);
+
+  if (disc.inherited) {
+    // No _dmarc at this subdomain: it inherits the org domain's policy — the sp
+    // (subdomain policy) tag if set, otherwise p (RFC 9989 tree walk).
+    const eff = sp || p;
+    const src = disc.source;
+    if (!VALID_POLICY.has(eff) || eff === "none") {
+      F.push({ area: "DMARC", severity: "high", title: "DMARC subdomain not enforced (inherited " + (sp ? "sp" : "p") + "=" + (eff || "<missing>") + " from " + src + ")",
+        detail: "This subdomain has no _dmarc record; it inherits " + src + "'s policy, which resolves to " + (eff || "<missing>") + " — spoofed mail from this subdomain isn't stopped.",
+        fix: "Publish _dmarc." + domain + " with p=reject, or set sp=reject on " + src + "." });
+    } else {
+      F.push({ area: "DMARC", severity: "pass", title: "DMARC enforced (inherited " + (sp ? "sp" : "p") + "=" + eff + " from " + src + ")",
+        detail: "This subdomain has no record of its own and is covered by " + src + "'s enforced policy.", fix: null, record: rec });
+    }
+    return;
+  }
+
+  const dmarcRecords = (await q("_dmarc." + disc.source, "TXT")).filter((r) => r.toLowerCase().startsWith("v=dmarc1"));
   if (dmarcRecords.length > 1) {
     F.push({ area: "DMARC", severity: "high", title: "Multiple DMARC records (invalid)",
       detail: dmarcRecords.length + " DMARC records exist at _dmarc. Exactly one is allowed — receivers ignore the policy entirely when there are several, so you effectively have no DMARC.",
       fix: "Keep one DMARC record and remove the rest." });
   }
-  const kv = {};
-  for (const m of rec.matchAll(/(\w+)=\s*([^;]+)/g)) kv[m[1]] = m[2];
-  const p = (kv.p || "none").trim().toLowerCase();
-  const sp = (kv.sp || "").trim().toLowerCase();
   const rua = "rua" in kv;
-  if (p === "none") {
+  if (!VALID_POLICY.has(p)) {
+    F.push({ area: "DMARC", severity: "high", title: "DMARC policy value is invalid (p=" + (p || "<missing>") + ")",
+      detail: "The p= tag must be exactly none, quarantine, or reject (RFC 9989). An unrecognized or missing value means receivers apply no enforcement — you have a DMARC record but no effective policy.",
+      fix: "Set p= to none (monitor), quarantine, or reject." });
+  } else if (p === "none") {
     F.push({ area: "DMARC", severity: "high", title: "DMARC policy is p=none (monitor only)",
       detail: "p=none means spoofed mail is still delivered. It's a valid starting point but offers no protection at rest; mailbox providers increasingly treat enforced policies as a trust signal.",
       fix: "After reviewing aggregate reports, ramp to p=quarantine then p=reject (optionally with pct= staging)." });
@@ -497,43 +621,66 @@ async function fetchMtaStsPolicy(domain, env, q) {
     const res = await fetch("https://mta-sts." + domain + "/.well-known/mta-sts.txt", {
       signal: AbortSignal.timeout(3000), redirect: "manual",
     });
-    if (!res.ok) return null;
+    // RFC 8461 §3.3: the policy MUST be served as HTTP 200 with Content-Type text/plain.
+    if (res.status !== 200) return null;
+    if (!(res.headers.get("content-type") || "").toLowerCase().includes("text/plain")) return null;
     return (await res.text()).slice(0, 8192);
   } catch (e) {
     return null;
   }
 }
 
+// RFC 8461 §3.2 policy validation. Returns { problems[], mode, maxAge, polMx }.
+// A well-formed policy has version: STSv1, a valid mode, an integer max_age in range,
+// and (unless mode: none) at least one mx:. Exported for conformance tests.
+export function mtaStsPolicyProblems(policy) {
+  const version = (policy.match(/^[ \t]*version:[ \t]*(\S+)/im) || [])[1];
+  const mode = ((policy.match(/^[ \t]*mode:[ \t]*(\w+)/im) || [])[1] || "").toLowerCase();
+  const maxAgeRaw = (policy.match(/^[ \t]*max_age:[ \t]*(\d+)/im) || [])[1];
+  const maxAge = maxAgeRaw === undefined ? null : parseInt(maxAgeRaw, 10);
+  const polMx = [...policy.matchAll(/^[ \t]*mx:[ \t]*(\S+)/gim)].map((m) => m[1]);
+  const problems = [];
+  if (!version || version.toLowerCase() !== "stsv1") problems.push("missing/invalid version (must be STSv1)");
+  if (!["enforce", "testing", "none"].includes(mode)) problems.push("missing/invalid mode");
+  if (maxAge === null || maxAge <= 0 || maxAge > 31557600) problems.push("missing/invalid max_age");
+  if (mode !== "none" && polMx.length === 0) problems.push("no mx entries");
+  return { problems, mode, maxAge, polMx };
+}
+
 async function checkMtaSts(domain, F, q) {
   const txt = await firstTxt("_mta-sts." + domain, "v=stsv1", q);
-  const policy = await fetchMtaStsPolicy(domain, null, q);
   if (!txt) {
     F.push({ area: "MTA-STS", severity: "medium", title: "No MTA-STS policy",
       detail: "MTA-STS lets you require TLS for inbound SMTP and is part of a modern transport posture (and a growing compliance ask under NIS2/gov mandates). Absent it, downgrade attacks on mail-in-transit are possible.",
       fix: "Publish _mta-sts TXT (v=STSv1; id=...) and host https://mta-sts.<domain>/.well-known/mta-sts.txt with mode: enforce." });
     return;
   }
-  const mm = (policy || "").match(/mode:\s*(\w+)/);
-  const mode = mm ? mm[1].toLowerCase() : "unknown";
+  const policy = await fetchMtaStsPolicy(domain, null, q);
+  if (!policy) {
+    F.push({ area: "MTA-STS", severity: "medium", title: "MTA-STS TXT present but policy file not retrievable",
+      detail: "The _mta-sts TXT record advertises a policy, but https://mta-sts." + domain + "/.well-known/mta-sts.txt did not return a valid policy (RFC 8461 requires HTTP 200 with Content-Type text/plain). Senders can't fetch it, so MTA-STS isn't actually enforced.",
+      fix: "Serve the policy at that URL over HTTPS with status 200 and Content-Type: text/plain." });
+    return;
+  }
+  const { problems, mode, polMx } = mtaStsPolicyProblems(policy);
+  if (problems.length) {
+    F.push({ area: "MTA-STS", severity: mode === "enforce" ? "high" : "medium", title: "MTA-STS policy is malformed",
+      detail: "The hosted policy is invalid (" + problems.join("; ") + "). RFC 8461 requires version: STSv1, a valid mode, an integer max_age, and at least one mx: (unless mode: none)." +
+        (mode === "enforce" ? " Under mode: enforce a malformed policy can break inbound mail delivery." : ""),
+      fix: "Fix the hosted mta-sts.txt to include version: STSv1, mode:, max_age:, and mx: lines per RFC 8461." });
+    return;
+  }
   F.push({ area: "MTA-STS", severity: mode === "enforce" ? "pass" : "medium", title: "MTA-STS present (mode: " + mode + ")",
     detail: "Policy published." + (mode === "enforce" ? "" : " mode is not 'enforce' — testing/none gives no real protection."),
     fix: mode === "enforce" ? null : "Move policy to mode: enforce once tested." });
-  if (policy) {
-    if (!/max_age:\s*(\d+)/.test(policy)) {
-      F.push({ area: "MTA-STS", severity: "low", title: "MTA-STS policy missing max_age",
-        detail: "The hosted policy has no max_age, so caching behavior is undefined and the policy may not 'stick' at senders.",
-        fix: "Add a max_age (e.g. max_age: 604800) to the hosted mta-sts.txt." });
-    }
-    const polMx = [...policy.matchAll(/mx:\s*(\S+)/g)].map((m) => m[1]);
-    const realMx = mxHosts(await q(domain, "MX"));
-    if (polMx.length && realMx.length) {
-      const unmatched = realMx.filter((h) => !polMx.some((p) => mxPatternMatches(p, h)));
-      if (unmatched.length) {
-        F.push({ area: "MTA-STS", severity: mode === "enforce" ? "high" : "medium", title: "MTA-STS policy does not cover all MX hosts",
-          detail: "These live MX hosts match no mx: line in the policy: " + unmatched.join(", ") + "." +
-            (mode === "enforce" ? " Under mode: enforce, senders will REFUSE to deliver to them — active mail loss." : " Once you move to enforce, mail to them will fail."),
-          fix: "Add the missing MX hostnames (or a *.<domain> wildcard) to the mx: lines in the hosted policy." });
-      }
+  const realMx = mxHosts(await q(domain, "MX"));
+  if (polMx.length && realMx.length) {
+    const unmatched = realMx.filter((h) => !polMx.some((p) => mxPatternMatches(p, h)));
+    if (unmatched.length) {
+      F.push({ area: "MTA-STS", severity: mode === "enforce" ? "high" : "medium", title: "MTA-STS policy does not cover all MX hosts",
+        detail: "These live MX hosts match no mx: line in the policy: " + unmatched.join(", ") + "." +
+          (mode === "enforce" ? " Under mode: enforce, senders will REFUSE to deliver to them — active mail loss." : " Once you move to enforce, mail to them will fail."),
+        fix: "Add the missing MX hostnames (or a *.<domain> wildcard) to the mx: lines in the hosted policy." });
     }
   }
 }
@@ -602,15 +749,23 @@ async function checkTransport(domain, F, q) {
     const pa = a.split(/\s+/)[0], pb = b.split(/\s+/)[0];
     return (/^\d+$/.test(pa) ? +pa : 99) - (/^\d+$/.test(pb) ? +pb : 99);
   })[0].split(/\s+/).pop().replace(/\.+$/, "");
-  const dane = await q("_25._tcp." + host, "TLSA");
+  const daneName = "_25._tcp." + host;
+  const dane = await q(daneName, "TLSA");
+  const daneMeta = q.meta ? await q.meta(daneName, "TLSA") : null;
   if (dane.length) {
     const bad = badTlsa(dane);
     if (bad) {
       F.push({ area: "Transport", severity: "medium", title: "DANE/TLSA present but misconfigured",
         detail: "TLSA records exist but " + bad + " For SMTP DANE only usage 3 (DANE-EE) or 2 (DANE-TA) are valid, and matching-type 1 (SHA-256) is recommended; an invalid record can break DANE-enforcing senders.",
         fix: "Correct the TLSA usage/selector/matching-type (typically '3 1 1' for the MX cert) and re-publish." });
+    } else if (daneMeta && daneMeta.ad === false) {
+      // TLSA present but the answer isn't DNSSEC-authenticated — DANE REQUIRES a validated
+      // chain (RFC 7672), so an unsigned TLSA is not active protection.
+      F.push({ area: "Transport", severity: "medium", title: "DANE/TLSA present but not DNSSEC-validated",
+        detail: "TLSA records exist but the response isn't DNSSEC-authenticated (AD bit not set). DANE requires a validated DNSSEC chain — without it senders can't trust the TLSA, so DANE gives no protection and can't be enforced.",
+        fix: "Enable DNSSEC on the zone so the TLSA records are cryptographically validated." });
     } else {
-      F.push({ area: "Transport", severity: "pass", title: "DANE/TLSA present", detail: "TLSA records bind the MX cert (requires DNSSEC).", fix: null });
+      F.push({ area: "Transport", severity: "pass", title: "DANE/TLSA present", detail: "TLSA records bind the MX cert" + (daneMeta && daneMeta.ad ? " (DNSSEC-validated)." : "."), fix: null });
     }
   } else {
     F.push({ area: "Transport", severity: "low", title: "No DANE/TLSA",
@@ -642,12 +797,18 @@ async function checkMxHygiene(domain, F, q) {
 
 async function checkDnssec(domain, F, q) {
   const keys = await q(domain, "DNSKEY");
-  if (keys.length) {
+  const meta = q.meta ? await q.meta(domain, "DNSKEY") : null;
+  // The AD (Authenticated Data) bit from a validating resolver is authoritative and
+  // respects the zone cut — a validated NODATA inside a signed parent still sets AD, so
+  // a subdomain isn't mis-reported as unsigned. Fall back to DNSKEY presence only when
+  // meta isn't available (non-DoH resolver / mock).
+  const signed = meta ? meta.ad : keys.length > 0;
+  if (signed) {
     F.push({ area: "DNSSEC", severity: "pass", title: "DNSSEC enabled",
-      detail: "The zone is DNSSEC-signed.", fix: null });
+      detail: "The zone is DNSSEC-signed and answers validate.", fix: null });
   } else {
     F.push({ area: "DNSSEC", severity: "low", title: "DNSSEC not enabled",
-      detail: "The zone publishes no DNSKEY, so DNS answers for this domain aren't cryptographically signed — and DANE can't be used without it. A trust/security gap more than a deliverability one.",
+      detail: "DNS answers for this domain aren't cryptographically signed/validated — and DANE can't be used without it. A trust/security gap more than a deliverability one.",
       fix: "Enable DNSSEC at your DNS provider (it's also the prerequisite for DANE)." });
   }
 }
@@ -902,7 +1063,22 @@ export async function auditDomain(domain, q) {
   }
   const summary = {};
   for (const s of ["critical", "high", "medium", "low", "pass"]) summary[s] = F.filter((f) => f.severity === s).length;
-  return { domain, primary_mx: mxHost, summary, findings: F };
+  // I20: if a CRITICAL lookup (SPF/DMARC/MX) hit a transient failure (SERVFAIL/REFUSED or
+  // a fetch error) the audit is inconclusive — those verdicts can't be trusted as "absent".
+  // Distinct from NXDOMAIN(3)/NODATA(0), which are conclusive. The Action folds this into
+  // audit-complete; other surfaces expose it for downstream consumers.
+  let inconclusive = false, inconclusiveReason = null;
+  if (typeof q === "function" && q.meta) {
+    for (const [n, t] of [[domain, "TXT"], ["_dmarc." + domain, "TXT"], [domain, "MX"]]) {
+      const m = await q.meta(n, t);
+      if (m.error || m.status === 2 || m.status === 5) {
+        inconclusive = true;
+        inconclusiveReason = t + " " + n + ": " + (m.error ? "lookup error" : "SERVFAIL/REFUSED");
+        break;
+      }
+    }
+  }
+  return { domain, primary_mx: mxHost, summary, findings: F, inconclusive, inconclusive_reason: inconclusiveReason };
 }
 
 // batch_score.py parity surface — the DNS-only, edge-safe Y/N buckets + gap.

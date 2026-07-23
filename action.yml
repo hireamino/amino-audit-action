@@ -18,6 +18,10 @@ inputs:
     description: "If 'true' and the event is a pull_request, post the audit summary as a PR comment (requires github-token). Fails soft."
     required: false
     default: "false"
+  continue-on-audit-error:
+    description: "If 'true' (default), a domain that can't be conclusively audited (DNS/engine error) sets audit-complete=false and passed=false but does NOT fail the build. Set 'false' to fail the build on any inconclusive audit (enforcement gate)."
+    required: false
+    default: "true"
   github-token:
     description: "Token used only to post the PR comment. Defaults to the workflow token."
     required: false
@@ -25,7 +29,9 @@ inputs:
 
 outputs:
   passed:
-    description: "'true' if the audit passed the fail-on threshold, else 'false'."
+    description: "'true' only if the audit passed the fail-on threshold AND every domain was conclusively audited (audit-complete). Otherwise 'false'."
+  audit-complete:
+    description: "'true' if every requested domain was conclusively audited; 'false' if any domain errored / was inconclusive."
   worst-severity:
     description: "The worst severity found across all domains (critical|high|medium|low), or 'none'."
   summary:
