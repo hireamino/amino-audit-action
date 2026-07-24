@@ -68,12 +68,14 @@ jobs:
 | `fail-on` | no | `advisory` | Severity threshold that fails the build: `advisory` \| `low` \| `medium` \| `high` \| `critical`. `advisory` never fails. |
 | `comment-on-pr` | no | `false` | If `true` and the event is a `pull_request`, post the summary as a PR comment (needs `github-token`). Fails soft. |
 | `github-token` | no | `${{ github.token }}` | Token used **only** to post the PR comment. |
+| `continue-on-audit-error` | no | `true` | When `true`, a domain that can't be conclusively audited (a transient DNS/engine error) sets `audit-complete=false` and `passed=false` but does **not** fail the build. Set `false` to fail the build on any inconclusive audit. |
 
 ## Outputs
 
 | Output | Description |
 | --- | --- |
-| `passed` | `true` if the audit passed the `fail-on` threshold, else `false`. |
+| `passed` | `true` only if the audit passed the `fail-on` threshold **and** every domain was conclusively audited (`audit-complete`); otherwise `false`. |
+| `audit-complete` | `true` if every requested domain was conclusively audited; `false` if any domain hit a transient DNS/engine error. |
 | `worst-severity` | Worst severity across all domains (`critical`/`high`/`medium`/`low`), or `none`. |
 | `summary` | Compact JSON array of per-domain severity counts. |
 
@@ -91,6 +93,8 @@ Severity order, worst-first: **critical > high > medium > low**. The build fails
 
 Start with `advisory` to see what the audit reports with zero risk, then ratchet up to `high` (a good default for enforcement) once you've cleaned house.
 
+**Inconclusive audits & input.** An empty or invalid `domains` input is a configuration error and always exits non-zero. If a domain can't be conclusively audited — a transient DNS failure (SERVFAIL/timeout) on a critical lookup — the run sets `audit-complete=false` and `passed=false` so a later step can react, but it does **not** fail the build unless you set `continue-on-audit-error: false`. `NXDOMAIN`/`NODATA` are treated as conclusive "absent", not errors.
+
 ## Example job summary
 
 The action writes a rich summary to the run's **Summary** tab — here's the live result for `hireamino.com`:
@@ -107,4 +111,4 @@ Apache-2.0 — © 2026 WBVP Enterprises Inc.
 
 ---
 
-**Powered by [Amino](https://hireamino.com/audit)** — run the full audit at [hireamino.com/audit](https://hireamino.com/audit), then let Amino watch your domain and warn you the moment it drifts: [hireamino.com/warmup](https://hireamino.com/warmup).
+**Powered by [Amino](https://hireamino.com/audit)** — run the full audit at [hireamino.com/audit](https://hireamino.com/audit), then let Amino watch your domain and warn you the moment it drifts: [hireamino.com/monitor](https://hireamino.com/monitor).
