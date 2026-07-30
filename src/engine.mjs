@@ -567,7 +567,7 @@ async function checkDmarc(domain, F, q) {
   } else if (p === "none") {
     F.push({ area: "DMARC", severity: "high", title: "DMARC policy is p=none (monitor only)",
       detail: "p=none means spoofed mail is still delivered. It's a valid starting point but offers no protection at rest; mailbox providers increasingly treat enforced policies as a trust signal.",
-      fix: "After reviewing aggregate reports, ramp to p=quarantine then p=reject (optionally with pct= staging)." });
+      fix: "After reviewing aggregate reports, ramp to p=quarantine and then p=reject. (Don't reach for pct= to stage it — RFC 9989 removed that tag; DMARCbis uses t=y for a testing period instead.)" });
   } else {
     F.push({ area: "DMARC", severity: "pass", title: "DMARC enforced (p=" + p + ")",
       detail: "Enforcement policy in place.", fix: null, record: rec });
@@ -651,8 +651,8 @@ async function checkMtaSts(domain, F, q) {
   const txt = await firstTxt("_mta-sts." + domain, "v=stsv1", q);
   if (!txt) {
     F.push({ area: "MTA-STS", severity: "medium", title: "No MTA-STS policy",
-      detail: "MTA-STS lets you require TLS for inbound SMTP and is part of a modern transport posture (and a growing compliance ask under NIS2/gov mandates). Absent it, downgrade attacks on mail-in-transit are possible.",
-      fix: "Publish _mta-sts TXT (v=STSv1; id=...) and host https://mta-sts.<domain>/.well-known/mta-sts.txt with mode: enforce." });
+      detail: "MTA-STS lets you require TLS for inbound SMTP and is part of a modern transport posture (and increasingly asked for in EU procurement, and specified in BSI's guidance for secure email transport (TR-03108)). Absent it, downgrade attacks on mail-in-transit are possible.",
+      fix: "Publish _mta-sts TXT (v=STSv1; id=...) and host https://mta-sts.<domain>/.well-known/mta-sts.txt. Stage it: publish TLS-RPT first so you get failure reports, start at mode: testing, confirm every production AND backup MX passes TLS, then switch to mode: enforce (RFC 8461 provides testing mode for exactly this)." });
     return;
   }
   const policy = await fetchMtaStsPolicy(domain, null, q);
@@ -769,7 +769,7 @@ async function checkTransport(domain, F, q) {
     }
   } else {
     F.push({ area: "Transport", severity: "low", title: "No DANE/TLSA",
-      detail: "No TLSA records on the MX. DANE is an emerging transport-security ask (NIS2/BSI) and depends on DNSSEC.",
+      detail: "No TLSA records on the MX. DANE is recommended in BSI guidance for secure email transport (TR-03108) and depends on DNSSEC.",
       fix: "If DNSSEC is enabled, publish TLSA records for the MX; otherwise enable DNSSEC first." });
   }
   return host;
@@ -1054,7 +1054,23 @@ export async function auditDomain(domain, q) {
     checkReverseDns(domain, rdns, q),
     checkCaa(domain, caa, q),
   ]);
-  const F = [...spf, ...dkim, ...dmarc, ...mta, ...simple, ...transport, ...mxh, ...dnssec, ...rep, ...aibots, ...rdns, ...caa];
+  // INBOUND-ONLY controls are not applicable to a domain that receives no mail. MTA-STS
+  // (RFC 8461) protects mail being delivered TO a domain, and a null MX (RFC 7505) or no
+  // MX at all says explicitly that none is. Recommending inbound TLS protection for mail
+  // that by definition never arrives is noise dressed as a finding — and it competed with
+  // real sending problems in the priority ranking. These checks run in parallel, so the MX
+  // verdict isn't known until they've all settled; filter here rather than serialise them.
+  const noInboundMail = transport.some((f) => /Null MX|No inbound mail servers/i.test(f.title || ""));
+  // TLS-RPT reports on TLS negotiation for mail arriving AT this domain, so it is
+  // inbound-only for the same reason MTA-STS is. (DANE needs no entry: checkTransport
+  // returns early on a null MX, so it is never probed.)
+  const inboundOnly = new Set(["MTA-STS", "TLS-RPT"]);
+  const mtaApplicable = noInboundMail
+    ? [{ area: "MTA-STS", severity: "pass", title: "MTA-STS not applicable — domain receives no mail",
+        detail: "MTA-STS tells sending servers to require TLS when delivering TO this domain. This domain publishes no inbound mail servers (a null MX, or none at all), so there is no inbound delivery for a policy to protect. Not a gap.", fix: null }]
+    : mta;
+  const F = [...spf, ...dkim, ...dmarc, ...mtaApplicable, ...simple, ...transport, ...mxh, ...dnssec, ...rep, ...aibots, ...rdns, ...caa]
+    .filter((f) => !(noInboundMail && inboundOnly.has(f.area) && f.severity !== "pass"));
   F.sort((x, y) => (SEV_ORDER[x.severity] ?? 5) - (SEV_ORDER[y.severity] ?? 5));
   for (const f of F) {
     const [effort, value] = priority(f);
@@ -1244,9 +1260,21 @@ function renderMatrix(domain, findings) {
     const gaps = findings.filter((f) => f.severity !== "pass");
     const byQuad = { "low,high": [], "high,high": [], "low,low": [], "high,low": [] };
     for (const f of gaps) byQuad[f.effort + "," + f.value].push(f);
-    // Empty high-value quadrants read as strong, not blank (locked treatment).
-    win = byQuad["low,high"].map(liGap).join("") || '<li class="ap-ok"><i class="ti ti-check" aria-hidden="true"></i> All solid — SPF, DKIM &amp; DMARC enforced</li>';
-    maj = byQuad["high,high"].map(liGap).join("") || '<li class="ap-ok"><i class="ti ti-check" aria-hidden="true"></i> Nothing major — posture is sound</li>';
+    // An empty quadrant means "nothing landed in THIS quadrant" — it does NOT license a
+    // claim about the whole domain. Until 2026-07-30 the fallbacks here asserted
+    // "All solid — SPF, DKIM & DMARC enforced" and "posture is sound" whenever their
+    // quadrant happened to be empty, regardless of what sat in the other three. On
+    // gmail.com (p=none, and its one discoverable selector carrying a revoked empty p=)
+    // that produced a report claiming DMARC was enforced directly above its own
+    // recommendations to ramp DMARC to p=reject and to confirm DKIM signing. One
+    // contradiction on the summary line discredits every finding under it.
+    // So: quadrant placeholders describe the quadrant, and the all-clear is stated ONLY
+    // when there are genuinely no gaps anywhere.
+    const clean = gaps.length === 0;
+    const allClear = '<li class="ap-ok"><i class="ti ti-check" aria-hidden="true"></i> No gaps found in any checked area</li>';
+    const emptyQuad = (label) => '<li class="ap-ph">' + label + '</li>';
+    win = byQuad["low,high"].map(liGap).join("") || (clean ? allClear : emptyQuad("Nothing quick and high-impact — see the other quadrants"));
+    maj = byQuad["high,high"].map(liGap).join("") || (clean ? allClear : emptyQuad("Nothing big and high-impact"));
     fill = byQuad["low,low"].map(liGap).join("");
     hard = byQuad["high,low"].map(liGap).join("");
     sub = 'for <code>' + esc(domain) + '</code> — ranked by effort &times; value';
@@ -1285,11 +1313,11 @@ const FAQ = [
   ["What is BIMI and is it worth it?",
     "BIMI shows your verified logo next to your emails in supporting inboxes (Gmail, Apple Mail, Yahoo). It requires a strong DMARC policy (quarantine or reject) as a prerequisite, and a VMC (Verified Mark Certificate) for the blue verified checkmark. It is worth it for brands sending real volume: it lifts recognition and open rates, and the DMARC prerequisite forces a strong authentication posture. High value — not just hardening."],
   ["What are the Gmail and Yahoo sender requirements?",
-    "Since 2024, Gmail and Yahoo require bulk senders (roughly 5,000+ messages/day to their users) to authenticate with SPF and DKIM, publish a DMARC policy with alignment, keep spam-complaint rates under about 0.3%, and support one-click unsubscribe. Microsoft has announced similar expectations. Mail that does not comply gets throttled or junked."],
+    "Since 2024, Gmail and Yahoo require bulk senders (roughly 5,000+ messages/day to their users) to authenticate with SPF and DKIM, publish a DMARC policy with alignment (Google explicitly allows that policy to be p=none — authentication is the requirement, enforcement is your choice), and keep spam-complaint rates under about 0.3%. One-click unsubscribe is required for marketing and subscribed messages specifically, not for transactional mail like receipts and alerts. Microsoft has announced similar expectations. Mail that does not comply gets throttled or junked."],
   ["What is DMARCbis?",
-    "DMARCbis is the modernized DMARC standard, published as RFC 9989 (May 2026), which obsoletes the original DMARC (RFC 7489). The changes that matter to operators: a DNS Tree Walk replaces the Public Suffix List for determining organizational domains; np= is a new policy for non-existent subdomains (set np=reject to shut down cousin-domain spoofing); and pct, rf, and ri are removed. If you run DMARC across subdomains, this is worth acting on now."],
+    "DMARCbis is the modernized DMARC standard, published as RFC 9989 (May 2026), which obsoletes the original DMARC (RFC 7489). The changes that matter to operators: a DNS Tree Walk replaces the Public Suffix List for determining organizational domains; np= is a new policy that applies specifically to NON-EXISTENT subdomains of your domain (set np=reject so nobody can send as a subdomain you never created). Note what it does not do: a lookalike \"cousin\" domain is a separate registration, and no DMARC policy on your domain can reach it; and pct, rf, and ri are removed. If you run DMARC across subdomains, this is worth acting on now."],
   ["Does email need to be post-quantum ready?",
-    "Eventually yes, and the clock is public. NIST guidance (IR 8547) sets today's classical crypto (RSA-2048, ECC P-256) as deprecated by 2030 and disallowed by 2035. For email this shows up in transport (TLS 1.3 is the floor for hybrid post-quantum key exchange), DKIM signing (the migration path is to larger PQC signatures — a domain on RSA-1024 DKIM is doubly behind), and DNSSEC. The cheap moves now — get to TLS 1.3, rotate off RSA-1024 DKIM — are also your PQC head start."],
+    "Eventually yes, and the clock is public. NIST's draft guidance on the transition (IR 8547, still an initial public draft rather than final) proposes treating today's classical crypto (RSA-2048, ECC P-256) as deprecated around 2030 and disallowed after 2035 — a direction of travel, not a settled mandate. For email this shows up in transport (TLS 1.3 is the floor for hybrid post-quantum key exchange), DKIM signing (where there is as yet NO standardized post-quantum path — the PQC signature schemes are large and the IETF work is early — so the actionable move today is classical hygiene: a domain still on RSA-1024 DKIM is behind on the standard that already exists), and DNSSEC. The cheap moves now — get to TLS 1.3, rotate off RSA-1024 DKIM — are also your PQC head start."],
   ["Do I need DNSSEC, and does it affect email?",
     "DNSSEC cryptographically signs your DNS so the answers — including your mail records — can't be forged in transit, and it's the prerequisite for DANE. It's more a security/trust measure than a direct deliverability lever: enable it when a security review or compliance requirement calls for it, or as part of a strong overall posture. The audit flags whether your zone is signed (and its answers cryptographically validate)."],
   ["Does my domain's age affect deliverability?",
@@ -1297,7 +1325,7 @@ const FAQ = [
   ["Can AI search engines like ChatGPT and Perplexity see my site?",
     "Increasingly people ask AI answer engines about vendors instead of searching, and those engines use their own crawlers (GPTBot, ClaudeBot, PerplexityBot, OAI-SearchBot, Google-Extended and others). If your robots.txt blocks them, your site is invisible to those answers. The audit checks whether your robots.txt is shutting AI crawlers out, so you can decide which to allow."],
   ["Is the audit really read-only? Does it change anything?",
-    "Yes, fully read-only. It inspects public DNS and drafts the exact changes for you to review, but it never touches your DNS, sends mail, or needs credentials. Nothing changes until you choose to apply a fix yourself."],
+    "Yes, fully read-only — though \"read\" covers a little more than DNS, so here is the whole list. It queries your public DNS records; it fetches your published MTA-STS policy over HTTPS (that file is served over HTTPS by design, not DNS); it reads your robots.txt to check AI-crawler visibility; and it looks up your domain's registration date via public RDAP. All four are public information that any mail server or crawler can read. It drafts the exact changes for you to review, but it never touches your DNS, sends mail, or needs credentials. Nothing changes until you choose to apply a fix yourself."],
 ];
 
 function faqJsonLd() {

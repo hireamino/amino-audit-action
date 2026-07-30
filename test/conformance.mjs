@@ -59,5 +59,32 @@ const assert = (name, cond) => { ok = cond && ok; console.log((cond ? "PASS" : "
   assert("I16 unfetchable policy → flagged", t.some((x) => x.includes("policy file not retrievable")));
   assert("I16 not reported present/enforced", !t.some((x) => x.includes("MTA-STS present")));
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 2026-07-30 — claim assertions. This engine is PUBLIC (GitHub Marketplace), and five
+// false claims sat here identically to the web tool and the public skill. The inventory
+// parity gate compares which CHECKS exist, not what they SAY, so wording was wrong in
+// lockstep and nothing caught it. These assert the text of this copy specifically.
+// ═══════════════════════════════════════════════════════════════════════════════
+{
+  const { readFileSync } = await import("node:fs");
+  const SRC = readFileSync(new URL("../src/engine.mjs", import.meta.url), "utf8");
+  assert("no empty-quadrant global all-clear", !/DKIM &amp; DMARC enforced<\/li>/.test(SRC));
+  assert("all-clear gated on zero gaps", /const clean = gaps\.length === 0/.test(SRC));
+  assert("np= not claimed to stop cousin-domain spoofing", !/np=reject to shut down cousin-domain spoofing/.test(SRC));
+  assert("np= scope stated correctly", /NON-EXISTENT subdomains of your domain/.test(SRC));
+  assert("IR 8547 draft status stated", /still an initial public draft/.test(SRC) && !/IR 8547\) sets today's classical crypto/.test(SRC));
+  assert("no PQC migration path claimed for DKIM", /NO standardized post-quantum path/.test(SRC));
+  assert("read-only answer names the HTTPS fetches", /fetches your published MTA-STS policy over HTTPS/.test(SRC));
+  assert("Gmail p=none allowance stated", /Google explicitly allows that policy to be p=none/.test(SRC));
+  assert("one-click unsubscribe scope stated", /marketing and subscribed messages specifically/.test(SRC));
+  assert("pct= not recommended for staging", !/optionally with pct= staging/.test(SRC));
+  assert("MTA-STS rollout staged via testing", /start at mode: testing/.test(SRC));
+  assert("MTA-STS cites BSI, not NIS2", !/growing compliance ask under NIS2/.test(SRC));
+  assert("inbound controls gated on receiving mail", /noInboundMail/.test(SRC));
+}
+
+// Summary LAST — it previously sat mid-file with a hard process.exit(), so anything
+// appended below never ran and could not fail CI. Verified with a canary.
 console.log(ok ? "\nALL PASS" : "\nSOME FAILED");
 process.exit(ok ? 0 : 1);
