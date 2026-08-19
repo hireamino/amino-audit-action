@@ -1005,7 +1005,7 @@ function action(f) {
     if (t.includes("partially enforced")) return "Raise DMARC pct to 100";
     if (t.includes("removed in rfc 9989")) return "Modernize DMARC tags for RFC 9989";
     if (t.includes("report destination")) return "Authorize the external DMARC report destination";
-    if (t.includes("rua")) return "Turn on DMARC reporting (rua)";
+    if (t.includes("rua")) return "Turn on DMARC reporting (rua) — needed before you enforce";
     return "Strengthen the DMARC policy";
   }
   if (a === "MTA-STS") {
