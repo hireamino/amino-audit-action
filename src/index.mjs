@@ -195,6 +195,21 @@ export function renderSummary(results, decision) {
       lines.push(`| ${sev} | ${mdCell(f.area)} | ${mdCell(f.title)} | ${mdCell(f.action || f.fix || "")} |`);
     }
     lines.push("");
+    // The table cell carries f.action, which is a short verb-led LABEL — deliberately so,
+    // since it also renders as a 2x2 tile on the web tool. Until now that label was the
+    // only remediation text this action emitted anywhere: f.fix and f.detail were built
+    // and then dropped, and the `summary` output carries severity counts, not findings.
+    // So the conditions attached to a fix (for DMARC: the RFC 9989 section 7.4 caveats on
+    // p=reject) never reached anyone running this in CI. Render fix behind a disclosure.
+    const fixes = gaps.filter((f) => f.fix);
+    if (fixes.length) {
+      lines.push("<details><summary>What to do about each of these</summary>");
+      lines.push("");
+      for (const f of fixes) lines.push(`- **${mdCell(f.title)}** — ${mdCell(f.fix)}`);
+      lines.push("");
+      lines.push("</details>");
+      lines.push("");
+    }
   }
 
   lines.push("---");

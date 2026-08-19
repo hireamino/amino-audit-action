@@ -79,6 +79,7 @@ const assert = (name, cond) => { ok = cond && ok; console.log((cond ? "PASS" : "
   assert("Gmail p=none allowance stated", /Google explicitly allows that policy to be p=none/.test(SRC));
   assert("one-click unsubscribe scope stated", /marketing and subscribed messages specifically/.test(SRC));
   assert("pct= not recommended for staging", !/optionally with pct= staging/.test(SRC));
+  assert("the pct removal is stated", /RFC 9989 removed pct/.test(SRC));
   assert("MTA-STS rollout staged via testing", /start at mode: testing/.test(SRC));
   assert("MTA-STS cites BSI, not NIS2", !/growing compliance ask under NIS2/.test(SRC));
   assert("inbound controls gated on receiving mail", /noInboundMail/.test(SRC));
@@ -86,5 +87,31 @@ const assert = (name, cond) => { ok = cond && ok; console.log((cond ? "PASS" : "
 
 // Summary LAST — it previously sat mid-file with a hard process.exit(), so anything
 // appended below never ran and could not fail CI. Verified with a canary.
+{ // DMARC enforcement advice — RFC 9989 §7.4
+  // The short action label is the ONLY remediation text the GitHub Action renders
+  // (index.mjs builds its table from f.action || f.fix), so it is asserted here
+  // BEHAVIOURALLY off a real audit, not by grepping the source.
+  const F = (await auditDomain("ex.com", makeQ({ "ex.com": {}, "_dmarc.ex.com": { TXT: ["v=DMARC1; p=none; rua=mailto:d@ex.com"] } }))).findings;
+  const pnone = F.find((f) => f.title.includes("p=none (monitor"));
+  assert("§7.4 the p=none finding is raised at all (positive control)", !!pnone);
+  assert("§7.4 label is the staged one", pnone?.action === "Review DMARC reports, then stage quarantine");
+  assert("§7.4 the short label does not name reject", !/reject/i.test(pnone?.action || ""));
+
+  // §7.4 scopes BOTH its "SHOULD NOT publish p=reject" and its month-then-month
+  // staging advice to domains hosting users who might post to mailing lists.
+  // Neither may be restated here as universal advice.
+  const { readFileSync: rfs } = await import("node:fs");
+  const SRC2 = rfs(new URL("../src/engine.mjs", import.meta.url), "utf8");
+  assert("§7.4 reject is not framed as the destination", !/ramp to p=quarantine/.test(SRC2));
+  assert("§7.4 no unevidenced provider trust-signal claim", !/increasingly treat enforced policies as a trust signal/.test(SRC2));
+  assert("§7.4 no claim that p=reject is 'the goal'", !/which is the goal and what large mailbox providers/.test(SRC2));
+  assert("§7.4 p=none is not called the most common deliverability mistake", !/most common deliverability mistake/.test(SRC2));
+  assert("§7.4 mailing-list caution is stated and scoped", /users may post to mailing lists not to publish p=reject/.test(SRC2));
+  assert("§7.4 staging advice is scoped, not universal", /for those that still do, it recommends at least a month/.test(SRC2));
+  assert("§7.4 DKIM-not-SPF-alone prerequisite is stated", /DMARC-aligned DKIM rather than relying only on SPF/.test(SRC2));
+  assert("t=y is offered in place of the removed pct", /use t=y to test an enforcement policy/.test(SRC2));
+  assert("the Google allowance is dated", /As of August 2026, Google's bulk-sender guidance permits p=none/.test(SRC2));
+}
+
 console.log(ok ? "\nALL PASS" : "\nSOME FAILED");
 process.exit(ok ? 0 : 1);

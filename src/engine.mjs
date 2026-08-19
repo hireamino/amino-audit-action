@@ -528,7 +528,7 @@ async function checkDmarc(domain, F, q) {
   if (!rec) {
     F.push({ area: "DMARC", severity: "critical", title: "No DMARC record",
       detail: "No policy at _dmarc. Receivers have no instruction on how to handle unauthenticated mail in your name — and as of 2024-25, Gmail/Yahoo/Microsoft require DMARC for bulk senders. This is both a spoofing exposure and a hard deliverability blocker.",
-      fix: 'Publish TXT at _dmarc: start with "v=DMARC1; p=none; rua=mailto:dmarc@<domain>" to collect reports, then ramp to p=quarantine and p=reject.' });
+      fix: 'Publish TXT at _dmarc: start with "v=DMARC1; p=none; rua=mailto:dmarc@<domain>" to collect reports. Review those reports before any enforcement, then stage p=quarantine; whether p=reject is appropriate depends on your mail flows (RFC 9989 §7.4).' });
     return;
   }
   const kv = {};
@@ -566,8 +566,8 @@ async function checkDmarc(domain, F, q) {
       fix: "Set p= to none (monitor), quarantine, or reject." });
   } else if (p === "none") {
     F.push({ area: "DMARC", severity: "high", title: "DMARC policy is p=none (monitor only)",
-      detail: "p=none means spoofed mail is still delivered. It's a valid starting point but offers no protection at rest; mailbox providers increasingly treat enforced policies as a trust signal.",
-      fix: "After reviewing aggregate reports, ramp to p=quarantine and then p=reject. (Don't reach for pct= to stage it — RFC 9989 removed that tag; DMARCbis uses t=y for a testing period instead.)" });
+      detail: "p=none offers, in the words of RFC 9989, no expression of preference — a receiver applying DMARC has nothing to act on, though its own filtering still applies. An enforcement policy requests quarantine or rejection of failures, but it can affect legitimate mail when an authorized sender is unauthenticated or misaligned, which is why aggregate reports come first. This is primarily an anti-spoofing gap, not a deliverability failure.",
+      fix: "Collect and review DMARC aggregate reports before enforcement, and remediate every legitimate unauthenticated or misaligned stream. Move to p=quarantine once authorized sources are passing. Before considering p=reject, ensure every legitimate stream has valid, DMARC-aligned DKIM rather than relying only on SPF. RFC 9989 §7.4 advises domains whose users may post to mailing lists not to publish p=reject; for those that still do, it recommends at least a month at p=none followed by an equally long period at p=quarantine. Treat reject as conditional on your mail flows, not as the default destination. RFC 9989 removed pct; use t=y to test an enforcement policy instead." });
   } else {
     F.push({ area: "DMARC", severity: "pass", title: "DMARC enforced (p=" + p + ")",
       detail: "Enforcement policy in place.", fix: null, record: rec });
@@ -1000,7 +1000,7 @@ function action(f) {
   if (a === "DMARC") {
     if (t.includes("no dmarc")) return "Publish a DMARC policy";
     if (t.includes("multiple dmarc")) return "Merge to a single DMARC record";
-    if (t.includes("p=none (monitor")) return "Ramp DMARC up to p=reject";
+    if (t.includes("p=none (monitor")) return "Review DMARC reports, then stage quarantine";
     if (t.includes("subdomain policy")) return "Set DMARC sp=reject for subdomains";
     if (t.includes("partially enforced")) return "Raise DMARC pct to 100";
     if (t.includes("removed in rfc 9989")) return "Modernize DMARC tags for RFC 9989";
@@ -1305,7 +1305,7 @@ const FAQ = [
   ["What's the difference between SPF, DKIM, and DMARC?",
     "They are three layers of proving an email is really from you. SPF lists which servers may send for your domain. DKIM cryptographically signs each message against a public key in your DNS. DMARC ties SPF and DKIM together with alignment (the authenticated domain must match the visible From: address) and tells receivers what to do when checks fail. You need all three — SPF and DKIM without an enforcing DMARC policy still leaves you spoofable."],
   ["What is the difference between p=none, p=quarantine, and p=reject?",
-    "DMARC's p= policy tells receivers how to handle mail that fails authentication. p=none is monitor-only — failing mail still gets delivered and anyone can still spoof you. p=quarantine sends failing mail to spam. p=reject rejects it outright, which is the goal and what large mailbox providers increasingly expect from bulk senders. The path is none to quarantine to reject, ramping as you confirm your legitimate mail passes. Staying on p=none forever is the most common deliverability mistake."],
+    "DMARC's p= policy tells receivers how to handle mail that fails authentication. p=none is monitor-only — the domain owner offers no expression of preference. p=quarantine asks receivers to treat failures as suspicious. p=reject requests rejection of DMARC-failing mail, although receivers can still apply local policy. Which policy is appropriate depends on your mail flows. RFC 9989 §7.4 says domains with users who may post to mailing lists should not publish p=reject, and any domain using p=reject must apply valid DKIM rather than relying only on SPF. Dedicated transactional domains may face fewer indirect-mail risks, but should still verify their actual flows. For affected user-mail domains considering reject, the RFC recommends at least a month at p=none and an equally long period at p=quarantine before proceeding. As of August 2026, Google's bulk-sender guidance permits p=none. Enforcement is primarily an anti-spoofing choice, not a universal deliverability requirement."],
   ["How do I know if my domain is ready to send cold or scaled outbound?",
     "Valid SPF/DKIM/DMARC records are necessary but not sufficient. Watch three traps: receive-only domains (auth records do not make a forwarding-only domain send-ready), alignment (your ESP's mail must align to your domain, not the ESP's), and never sending cold or scaled outbound from your root domain — use a dedicated sending subdomain so a reputation hit on cold outreach does not poison your primary mail."],
   ["Do I need MTA-STS, TLS-RPT, and DANE?",

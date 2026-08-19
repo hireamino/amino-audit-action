@@ -204,6 +204,40 @@ try {
   check(`live smoke test threw: ${e.message}`, false);
 }
 
+// ── remediation disclosure ───────────────────────────────────────────────────
+// The table cell renders f.action, a short LABEL. f.fix used to be dropped entirely,
+// so the conditions on a fix never reached anyone running this in CI. Assert the
+// disclosure both ways: it must appear when a fix exists, and must NOT appear when
+// none does (an empty <details> is worse than no <details>).
+{
+  const withFix = {
+    domain: "d1.example", summary: { high: 1 },
+    findings: [{ area: "DMARC", severity: "high", title: "DMARC policy is p=none (monitor only)",
+      action: "Review DMARC reports, then stage quarantine",
+      fix: "Before considering p=reject, ensure every legitimate stream has valid, DMARC-aligned DKIM rather than relying only on SPF." }],
+  };
+  const md = renderSummary([withFix], decide([withFix], "advisory"));
+  check("the short label still renders in the table", md.includes("Review DMARC reports, then stage quarantine"));
+  check("the fix renders in a disclosure", /<details><summary>/.test(md) && md.includes("</details>"));
+  check("the fix TEXT actually reaches the reader", md.includes("DMARC-aligned DKIM rather than relying only on SPF"));
+
+  const noFix = {
+    domain: "d2.example", summary: { low: 1 },
+    findings: [{ area: "MX", severity: "low", title: "something", action: "Do a thing", fix: null }],
+  };
+  const md2 = renderSummary([noFix], decide([noFix], "advisory"));
+  check("no empty disclosure when nothing carries a fix", !md2.includes("<details>"));
+
+  const nasty = {
+    domain: "d3.example", summary: { high: 1 },
+    findings: [{ area: "DMARC", severity: "high", title: "t", action: "a",
+      fix: "</details><script>alert(1)</script>|evil|" }],
+  };
+  const md3 = renderSummary([nasty], decide([nasty], "advisory"));
+  check("a hostile fix string cannot close the disclosure or inject a table row",
+    !md3.includes("</details><script>") && !/\|evil\|/.test(md3));
+}
+
 console.log("");
 console.log(`Results: ${pass} passed, ${fail} failed.`);
 process.exit(fail ? 1 : 0);
