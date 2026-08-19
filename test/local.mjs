@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 // Local test harness — pure-logic unit tests with synthetic findings + one live
 // smoke test against hireamino.com. Prints PASS/FAIL per check; exits non-zero on
 // any failure. No third-party deps.
@@ -202,6 +204,25 @@ try {
   check("renders a non-empty summary for the live result", md.length > 200);
 } catch (e) {
   check(`live smoke test threw: ${e.message}`, false);
+}
+
+// ── wordmark ────────────────────────────────────────────────────────────────
+// This engine is a VENDORED copy of amino-site functions/audit.js, and the mark
+// inside it is a copy of amino-site brand/wordmark.svg. amino-site's parity gate
+// cannot see this repo, so this is its half of the contract.
+//
+// ⚠️ Note what this does NOT assert: that the engine as a whole is in sync with its
+// source. It has drifted ~120 lines (action strings, the evidence table, CTA copy),
+// and the source now imports ./_metrics.mjs which does not exist here — so a straight
+// re-sync would break the build. That is a real and separate problem; this check only
+// pins the logo.
+{
+  const WORDMARK_SHA256 = "e57ecced3e6d2d044d595d3314b7b61760b8cbb0460c04ef4fa80982e623ca68";
+  const src = readFileSync(new URL("../src/engine.mjs", import.meta.url), "utf8");
+  const found = src.match(/<svg[^>]*\brole="img"[^>]*>[\s\S]*?<\/svg>/g) || [];
+  check("wordmark: exactly one mark in the page shell (guards a vacuous hash check)", found.length === 1);
+  check("wordmark: byte-identical to amino-site brand/wordmark.svg",
+    found.length === 1 && createHash("sha256").update(found[0]).digest("hex") === WORDMARK_SHA256);
 }
 
 console.log("");
