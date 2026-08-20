@@ -48,8 +48,15 @@ jobs:
       - name: Run conformance checks (correctness spec)
         run: node test/conformance.mjs
 
-      - name: Clone amino-skills (shared conformance corpus — public)
-        run: git clone --depth 1 https://github.com/hireamino/amino-skills.git /tmp/amino-skills
+      # The pin script is what decides which remote code runs on this runner, so it is
+      # canaried here rather than trusted from a laptop: every guard must reject the case
+      # it exists for, a healthy pin must still be accepted, and the case count is pinned
+      # so a case that errors out of existence fails instead of shrinking the run.
+      - name: Canary the pinned-fetch guards
+        run: bash scripts/canary-fetch-pinned-skills.sh
+
+      - name: Clone amino-skills at the pinned revision (public, token-free)
+        run: scripts/fetch-pinned-skills.sh /tmp/amino-skills
 
       - name: Fixtures-driven conformance runner (shared corpus — hard gate)
         env:
