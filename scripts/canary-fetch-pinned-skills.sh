@@ -25,14 +25,22 @@ REAL=$(git rev-parse HEAD)
 cd - >/dev/null
 
 run(){ PIN_FILE="$TMP/pin" SKILLS_REMOTE="$LOCAL" "$SCRIPT" "$TMP/dest" >/dev/null 2>&1; echo $?; }
+# Exit code alone cannot tell "a guard rejected this" from "the fetch failed anyway" —
+# a malformed pin is refused by git regardless, so loosening a guard leaves every
+# exit-code assertion green. Assert WHICH guard spoke.
+# ::error:: goes to STDOUT — that is GitHub's workflow-command convention, not stderr.
+msg(){ PIN_FILE="$TMP/pin" SKILLS_REMOTE="$LOCAL" "$SCRIPT" "$TMP/dest" 2>&1 | grep "^::error::" | head -1; }
+okmsg(){ case "$1" in *"$2"*) echo "PASS  $3"; pass=$((pass+1));; *) echo "FAIL  $3 (said: $1)"; fail=$((fail+1));; esac; }
 
 printf '%s\n' "$REAL" > "$TMP/pin";           ok "$(run)" 0 "healthy pin is ACCEPTED (positive control)"
 printf '# only a comment\n' > "$TMP/pin";     ok "$(run)" 1 "comment-only pin file is refused"
 : > "$TMP/pin";                               ok "$(run)" 1 "empty pin file is refused"
 printf '%s\n' "${REAL:0:39}" > "$TMP/pin";    ok "$(run)" 1 "39-char SHA is refused"
+okmsg "$(msg)" "expected a full 40-char SHA" "39-char SHA is refused BY THE LENGTH GUARD, before any fetch"
 printf '%s\n' "${REAL}a" > "$TMP/pin";        ok "$(run)" 1 "41-char SHA is refused"
 
 printf 'main\n' > "$TMP/pin";                 ok "$(run)" 1 "a branch NAME is refused"
+okmsg "$(msg)" "is not lowercase hex" "a branch NAME is refused BY THE HEX GUARD, before any fetch"
 printf '%s\n' "$(printf %s "$REAL" | tr '[:lower:]' '[:upper:]')" > "$TMP/pin"
 ok "$(run)" 1 "uppercase SHA is refused"
 printf '%s\n' "$(printf '0%.0s' {1..40})" > "$TMP/pin"; ok "$(run)" 1 "well-formed but absent SHA is refused"
@@ -49,7 +57,7 @@ grep -q '\[ "$got" = "$pin" \]' "$SCRIPT" && ok 0 0 "HEAD-vs-pin verification is
 # A case that errors (bash-4-ism on macOS, a typo, a deleted block) simply stops
 # producing its line — the suite then reports fewer passes and still exits 0. That
 # happened to the uppercase case while writing this file. Pin the count.
-EXPECTED=11
+EXPECTED=13
 echo; echo "canary: $pass passed, $fail failed (expected $EXPECTED cases)"
 [ $((pass+fail)) -eq "$EXPECTED" ] || { echo "FAIL  ran $((pass+fail)) cases, expected $EXPECTED — a case vanished"; exit 1; }
 [ "$fail" -eq 0 ]
