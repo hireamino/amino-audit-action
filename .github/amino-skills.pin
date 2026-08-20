@@ -1,0 +1,11 @@
+# The amino-skills revision this repo's conformance run is executed FROM.
+#
+# security-gate.yml used to `git clone --depth 1` whatever amino-skills main happened
+# to be and then run conformance/run.mjs from it. Two problems with that: the corpus
+# this repo is judged against could change without a commit here, and — the reason it
+# is pinned rather than merely fetched carefully — anything landing on that repo's main
+# EXECUTES on this runner, unreviewed, at the moment it lands.
+#
+# Bump deliberately, in the change that reconciles this engine with that revision.
+# amino-site carries the same file for the same reason (.github/amino-skills.pin).
+2dd31e9da495c87e840c840a65d9065c9e54096e
