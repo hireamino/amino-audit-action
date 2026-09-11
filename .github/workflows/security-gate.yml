@@ -61,4 +61,11 @@ jobs:
       - name: Fixtures-driven conformance runner (shared corpus — hard gate)
         env:
           ENGINE: ${{ github.workspace }}/src/engine.mjs
+          SURFACE: action
         run: node /tmp/amino-skills/conformance/run.mjs
+
+      - name: Mutation canaries (material contract — hard gate)
+        env:
+          ENGINE: ${{ github.workspace }}/src/engine.mjs
+          SURFACE: action
+        run: node /tmp/amino-skills/conformance/canary.mjs
