@@ -755,12 +755,13 @@ async function checkTransport(domain, F, q) {
   const mx = await q(domain, "MX");
   if (!mx.length) {
     F.push({ area: "Transport", severity: "low", title: "No MX records",
-      detail: "No inbound mail servers (may be intentional for a send-only/parked domain).", fix: null });
+      detail: "No MX record is published. SMTP then treats the domain as if it had an implicit MX pointing to itself and resolves that host's address records, so this does not show that the domain receives no mail — a null MX (0 .) is what says that explicitly. This may be intentional for a send-only or parked domain.",
+      fix: "If it should receive mail, publish MX records. If it should not, publish a null MX (0 .) so receivers know." });
     return null;
   }
   if (isNullMx(mx)) {
     F.push({ area: "Transport", severity: "pass", title: "Null MX (RFC 7505) — domain declares no mail",
-      detail: "A null MX (0 .) correctly signals this domain neither sends nor receives mail, which helps receivers reject spoofed mail from it. Good hygiene for a non-mail domain.", fix: null });
+      detail: "A null MX (0 .) declares under RFC 7505 that this domain accepts no inbound mail. That is good hygiene for a domain not meant to receive mail. It says nothing about whether the domain sends — outbound authentication is assessed separately.", fix: null });
     return null;
   }
   const host = realMxRows(mx).sort((a, b) => {
@@ -982,7 +983,7 @@ function priority(f) {
     return ["high", "low"];
   }
   if (a === "TLS-RPT") return ["low", "low"];
-  if (a === "BIMI") return ["high", "high"];
+  if (a === "BIMI") return ["high", "low"];
   if (a === "MX") return ["low", "high"];
   if (a === "Transport") return t.includes("dane") ? ["high", "low"] : ["low", "low"];
   if (a === "DNSSEC") return ["high", "low"];          // security/trust, not a deliverability lever → Hardening
@@ -1037,6 +1038,7 @@ function action(f) {
   if (a === "BIMI") return t.includes("without a vmc") ? "Add a VMC to your BIMI record" : "Get a VMC, then publish BIMI";
   if (a === "MX") return "Consolidate to one MX provider";
   if (a === "Transport") {
+    if (t === "no mx records") return "Confirm whether this domain should receive mail";
     if (t.includes("misconfigured")) return "Correct the DANE/TLSA record";
     if (t.includes("no reverse dns") || t.includes("has no reverse")) return "Set reverse DNS (PTR) for your mail server";
     if (t.includes("forward-confirmed")) return "Fix forward-confirmed reverse DNS (FCrDNS)";

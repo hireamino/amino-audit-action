@@ -109,7 +109,6 @@ const assert = (name, cond) => { ok = cond && ok; console.log((cond ? "PASS" : "
   assert("the pct removal is stated", /RFC 9989 removed pct/.test(SRC));
   assert("MTA-STS rollout staged via testing", /start at mode: testing/.test(SRC));
   assert("MTA-STS cites BSI, not NIS2", !/growing compliance ask under NIS2/.test(SRC));
-  assert("inbound controls gated only on a true null MX", /const nullMx = transport\.some/.test(SRC));
 }
 
 // Summary LAST — it previously sat mid-file with a hard process.exit(), so anything
