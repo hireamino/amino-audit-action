@@ -2,7 +2,7 @@
 // Runs auditDomain() against canned DNS (mock resolver, no network) and asserts the
 // v1.2 batch-1 false-pass fixtures now produce the correct verdict. Exits non-zero on
 // any violation so it runs as a CI gate.
-import { auditDomain, mtaStsPolicyProblems } from "../src/engine.mjs";
+import { auditDomain, buckets, mtaStsPolicyProblems } from "../src/engine.mjs";
 
 function makeQ(dns, dkimRec) {
   return async (name, type) => {
@@ -59,6 +59,33 @@ const assert = (name, cond) => { ok = cond && ok; console.log((cond ? "PASS" : "
   assert("I16 unfetchable policy → flagged", t.some((x) => x.includes("policy file not retrievable")));
   assert("I16 not reported present/enforced", !t.some((x) => x.includes("MTA-STS present")));
 }
+{ // WHI-50 — only a true null MX exempts inbound-only controls
+  const nullMxDns = {
+    "nomail.invalid": { TXT: ["v=spf1 -all"], MX: ["0 ."] },
+    "_dmarc.nomail.invalid": { TXT: ["v=DMARC1; p=reject"] },
+  };
+  const nullFindings = (await auditDomain("nomail.invalid", makeQ(nullMxDns))).findings;
+  const nullScore = await buckets("nomail.invalid", makeQ(nullMxDns));
+  assert("WHI-50 null MX → MTA-STS not applicable", nullFindings.some((f) => f.title === "MTA-STS not applicable — domain receives no mail"));
+  assert("WHI-50 null MX → no TLS-RPT or DANE gap", !nullFindings.some((f) => ["TLS-RPT"].includes(f.area) || /DANE/.test(f.title)));
+  assert("WHI-50 null MX → inbound score buckets are N/A and gap is 2", nullScore.MTA_STS === null && nullScore.TLS_RPT === null && nullScore.DANE === null && nullScore.gap === 2);
+
+  const noMxDns = {
+    "nomx.invalid": { TXT: ["v=spf1 -all"] },
+    "_dmarc.nomx.invalid": { TXT: ["v=DMARC1; p=reject"] },
+  };
+  const noMxFindings = (await auditDomain("nomx.invalid", makeQ(noMxDns))).findings;
+  const noMxScore = await buckets("nomx.invalid", makeQ(noMxDns));
+  assert("WHI-50 no MX → inbound controls still apply", noMxFindings.some((f) => f.title === "No MTA-STS policy") && noMxFindings.some((f) => f.title === "No TLS-RPT") && noMxScore.MTA_STS === false && noMxScore.gap === 5);
+
+  const ambiguousDns = {
+    "ambiguous.invalid": { TXT: ["v=spf1 -all"], MX: ["0 .", "10 mx.ambiguous.invalid."] },
+    "_dmarc.ambiguous.invalid": { TXT: ["v=DMARC1; p=reject"] },
+  };
+  const ambiguousFindings = (await auditDomain("ambiguous.invalid", makeQ(ambiguousDns))).findings;
+  const ambiguousScore = await buckets("ambiguous.invalid", makeQ(ambiguousDns));
+  assert("WHI-50 ambiguous MX → fails toward reporting", ambiguousFindings.some((f) => f.title === "No MTA-STS policy") && ambiguousFindings.some((f) => f.title === "No DANE/TLSA") && ambiguousScore.MTA_STS === false && ambiguousScore.gap === 5);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 2026-07-30 — claim assertions. This engine is PUBLIC (GitHub Marketplace), and five
@@ -82,7 +109,7 @@ const assert = (name, cond) => { ok = cond && ok; console.log((cond ? "PASS" : "
   assert("the pct removal is stated", /RFC 9989 removed pct/.test(SRC));
   assert("MTA-STS rollout staged via testing", /start at mode: testing/.test(SRC));
   assert("MTA-STS cites BSI, not NIS2", !/growing compliance ask under NIS2/.test(SRC));
-  assert("inbound controls gated on receiving mail", /noInboundMail/.test(SRC));
+  assert("inbound controls gated only on a true null MX", /const nullMx = transport\.some/.test(SRC));
 }
 
 // Summary LAST — it previously sat mid-file with a hard process.exit(), so anything
