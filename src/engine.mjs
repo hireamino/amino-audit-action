@@ -252,9 +252,28 @@ function mxHosts(mxRows) {
   const out = [];
   for (const r of mxRows) {
     const parts = r.split(/\s+/);
-    if (parts.length >= 2 && /^\d+$/.test(parts[0])) out.push(parts[parts.length - 1].replace(/\.+$/, "").toLowerCase());
+    if (parts.length >= 2 && /^\d+$/.test(parts[0])) {
+      const host = parts[parts.length - 1].replace(/\.+$/, "").toLowerCase();
+      if (host) out.push(host);
+    }
   }
   return out;
+}
+
+function isNullMxRow(row) {
+  // WHI-50 changes only mixed-answer ambiguity. Preserve the earlier root-exchange
+  // spellings, including a non-zero preference, rather than redesign detection here.
+  const parts = row.trim().split(/\s+/);
+  return parts.length > 0
+    && (parts[parts.length - 1].replace(/\.+$/, "") === "" || ["0 .", "0."].includes(row.trim()));
+}
+
+function isNullMx(mxRows) {
+  return mxRows.length > 0 && mxRows.every(isNullMxRow);
+}
+
+function realMxRows(mxRows) {
+  return mxRows.filter((row) => !isNullMxRow(row));
 }
 
 function mxPatternMatches(pattern, host) {
@@ -739,13 +758,12 @@ async function checkTransport(domain, F, q) {
       detail: "No inbound mail servers (may be intentional for a send-only/parked domain).", fix: null });
     return null;
   }
-  const isNull = mx.some((r) => { const p = r.split(/\s+/); return p[p.length - 1].replace(/\.+$/, "") === "" || ["0 .", "0."].includes(r.trim()); });
-  if (isNull) {
+  if (isNullMx(mx)) {
     F.push({ area: "Transport", severity: "pass", title: "Null MX (RFC 7505) — domain declares no mail",
       detail: "A null MX (0 .) correctly signals this domain neither sends nor receives mail, which helps receivers reject spoofed mail from it. Good hygiene for a non-mail domain.", fix: null });
     return null;
   }
-  const host = mx.slice().sort((a, b) => {
+  const host = realMxRows(mx).sort((a, b) => {
     const pa = a.split(/\s+/)[0], pb = b.split(/\s+/)[0];
     return (/^\d+$/.test(pa) ? +pa : 99) - (/^\d+$/.test(pb) ? +pb : 99);
   })[0].split(/\s+/).pop().replace(/\.+$/, "");
@@ -905,8 +923,10 @@ function reverseName(ip) { return ip.split(".").reverse().join(".") + ".in-addr.
 async function checkReverseDns(domain, F, q) {
   const mx = await q(domain, "MX");
   if (!mx.length) return;
-  if (mx.some((r) => { const p = r.split(/\s+/); return p[p.length - 1].replace(/\.+$/, "") === ""; })) return; // null MX
-  const host = mx.slice().sort((a, b) => {
+  if (isNullMx(mx)) return;
+  const realMx = realMxRows(mx);
+  if (!realMx.length) return;
+  const host = realMx.sort((a, b) => {
     const pa = a.split(/\s+/)[0], pb = b.split(/\s+/)[0];
     return (/^\d+$/.test(pa) ? +pa : 99) - (/^\d+$/.test(pb) ? +pb : 99);
   })[0].split(/\s+/).pop().replace(/\.+$/, "");
@@ -1054,23 +1074,22 @@ export async function auditDomain(domain, q) {
     checkReverseDns(domain, rdns, q),
     checkCaa(domain, caa, q),
   ]);
-  // INBOUND-ONLY controls are not applicable to a domain that receives no mail. MTA-STS
-  // (RFC 8461) protects mail being delivered TO a domain, and a null MX (RFC 7505) or no
-  // MX at all says explicitly that none is. Recommending inbound TLS protection for mail
+  // INBOUND-ONLY controls are not applicable to a domain that publishes a true null MX.
+  // MTA-STS (RFC 8461) protects mail being delivered TO a domain. Recommending it for mail
   // that by definition never arrives is noise dressed as a finding — and it competed with
   // real sending problems in the priority ranking. These checks run in parallel, so the MX
   // verdict isn't known until they've all settled; filter here rather than serialise them.
-  const noInboundMail = transport.some((f) => /Null MX|No inbound mail servers/i.test(f.title || ""));
+  const nullMx = transport.some((f) => /^Null MX \(RFC 7505\)/.test(f.title || ""));
   // TLS-RPT reports on TLS negotiation for mail arriving AT this domain, so it is
   // inbound-only for the same reason MTA-STS is. (DANE needs no entry: checkTransport
   // returns early on a null MX, so it is never probed.)
   const inboundOnly = new Set(["MTA-STS", "TLS-RPT"]);
-  const mtaApplicable = noInboundMail
+  const mtaApplicable = nullMx
     ? [{ area: "MTA-STS", severity: "pass", title: "MTA-STS not applicable — domain receives no mail",
-        detail: "MTA-STS tells sending servers to require TLS when delivering TO this domain. This domain publishes no inbound mail servers (a null MX, or none at all), so there is no inbound delivery for a policy to protect. Not a gap.", fix: null }]
+        detail: "MTA-STS tells sending servers to require TLS when delivering TO this domain. This domain publishes a null MX, so there is no inbound delivery for a policy to protect. Not a gap.", fix: null }]
     : mta;
   const F = [...spf, ...dkim, ...dmarc, ...mtaApplicable, ...simple, ...transport, ...mxh, ...dnssec, ...rep, ...aibots, ...rdns, ...caa]
-    .filter((f) => !(noInboundMail && inboundOnly.has(f.area) && f.severity !== "pass"));
+    .filter((f) => !(nullMx && inboundOnly.has(f.area) && f.severity !== "pass"));
   F.sort((x, y) => (SEV_ORDER[x.severity] ?? 5) - (SEV_ORDER[y.severity] ?? 5));
   for (const f of F) {
     const [effort, value] = priority(f);
@@ -1097,7 +1116,7 @@ export async function auditDomain(domain, q) {
   return { domain, primary_mx: mxHost, summary, findings: F, inconclusive, inconclusive_reason: inconclusiveReason };
 }
 
-// batch_score.py parity surface — the DNS-only, edge-safe Y/N buckets + gap.
+// batch_score.py parity surface — the DNS-only, edge-safe Y/N/N/A buckets + gap.
 // Exported for the golden-set parity harness (diff vs Python batch_score.py).
 export async function buckets(domain, q) {
   q = q || makeResolver();
@@ -1129,11 +1148,19 @@ export async function buckets(domain, q) {
     if (!r.DMARC_rua) note.push("no rua");
   } else note.push("no DMARC");
 
-  r.MTA_STS = !!(await firstTxt("_mta-sts." + domain, "v=stsv1", q));
-  r.TLS_RPT = !!(await firstTxt("_smtp._tls." + domain, "v=tlsrptv1", q));
   const mx = await q(domain, "MX");
-  if (mx.length) {
-    const host = mx.slice().sort((a, b) => {
+  const nullMx = isNullMx(mx);
+  if (nullMx) {
+    r.MTA_STS = null;
+    r.TLS_RPT = null;
+    r.DANE = null;
+  } else {
+    r.MTA_STS = !!(await firstTxt("_mta-sts." + domain, "v=stsv1", q));
+    r.TLS_RPT = !!(await firstTxt("_smtp._tls." + domain, "v=tlsrptv1", q));
+  }
+  const realMx = realMxRows(mx);
+  if (realMx.length && !nullMx) {
+    const host = realMx.sort((a, b) => {
       const pa = a.split(/\s+/)[0], pb = b.split(/\s+/)[0];
       return (/^\d+$/.test(pa) ? +pa : 99) - (/^\d+$/.test(pb) ? +pb : 99);
     })[0].split(/\s+/).pop().replace(/\.+$/, "");
@@ -1144,7 +1171,7 @@ export async function buckets(domain, q) {
   r.BIMI = !!(await firstTxt("default._bimi." + domain, "v=bimi1", q));
 
   const bool = ["SPF", "DMARC", "DMARC_enforced", "DMARC_rua", "MTA_STS", "TLS_RPT", "DANE", "BIMI"];
-  let gap = bool.filter((b) => !r[b]).length;
+  let gap = bool.filter((b) => r[b] === false).length;
   if (r.DKIM === "weak") gap += 1;
   return { ...r, gap, note: note.length ? note.join("; ") : "clean" };
 }
