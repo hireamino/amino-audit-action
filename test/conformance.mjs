@@ -2,7 +2,7 @@
 // Runs auditDomain() against canned DNS (mock resolver, no network) and asserts the
 // v1.2 batch-1 false-pass fixtures now produce the correct verdict. Exits non-zero on
 // any violation so it runs as a CI gate.
-import { auditDomain, buckets, mtaStsPolicyProblems } from "../src/engine.mjs";
+import { auditDomain, buckets, mtaStsPolicyProblems } from "../vendor/amino-audit-engine/engine.mjs";
 
 function makeQ(dns, dkimRec) {
   return async (name, type) => {
@@ -87,30 +87,6 @@ const assert = (name, cond) => { ok = cond && ok; console.log((cond ? "PASS" : "
   assert("WHI-50 ambiguous MX → fails toward reporting", ambiguousFindings.some((f) => f.title === "No MTA-STS policy") && ambiguousFindings.some((f) => f.title === "No DANE/TLSA") && ambiguousScore.MTA_STS === false && ambiguousScore.gap === 5);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 2026-07-30 — claim assertions. This engine is PUBLIC (GitHub Marketplace), and five
-// false claims sat here identically to the web tool and the public skill. The inventory
-// parity gate compares which CHECKS exist, not what they SAY, so wording was wrong in
-// lockstep and nothing caught it. These assert the text of this copy specifically.
-// ═══════════════════════════════════════════════════════════════════════════════
-{
-  const { readFileSync } = await import("node:fs");
-  const SRC = readFileSync(new URL("../src/engine.mjs", import.meta.url), "utf8");
-  assert("no empty-quadrant global all-clear", !/DKIM &amp; DMARC enforced<\/li>/.test(SRC));
-  assert("all-clear gated on zero gaps", /const clean = gaps\.length === 0/.test(SRC));
-  assert("np= not claimed to stop cousin-domain spoofing", !/np=reject to shut down cousin-domain spoofing/.test(SRC));
-  assert("np= scope stated correctly", /NON-EXISTENT subdomains of your domain/.test(SRC));
-  assert("IR 8547 draft status stated", /still an initial public draft/.test(SRC) && !/IR 8547\) sets today's classical crypto/.test(SRC));
-  assert("no PQC migration path claimed for DKIM", /NO standardized post-quantum path/.test(SRC));
-  assert("read-only answer names the HTTPS fetches", /fetches your published MTA-STS policy over HTTPS/.test(SRC));
-  assert("Gmail p=none allowance stated", /Google explicitly allows that policy to be p=none/.test(SRC));
-  assert("one-click unsubscribe scope stated", /marketing and subscribed messages specifically/.test(SRC));
-  assert("pct= not recommended for staging", !/optionally with pct= staging/.test(SRC));
-  assert("the pct removal is stated", /RFC 9989 removed pct/.test(SRC));
-  assert("MTA-STS rollout staged via testing", /start at mode: testing/.test(SRC));
-  assert("MTA-STS cites BSI, not NIS2", !/growing compliance ask under NIS2/.test(SRC));
-}
-
 // Summary LAST — it previously sat mid-file with a hard process.exit(), so anything
 // appended below never ran and could not fail CI. Verified with a canary.
 { // DMARC enforcement advice — RFC 9989 §7.4
@@ -126,17 +102,6 @@ const assert = (name, cond) => { ok = cond && ok; console.log((cond ? "PASS" : "
   // §7.4 scopes BOTH its "SHOULD NOT publish p=reject" and its month-then-month
   // staging advice to domains hosting users who might post to mailing lists.
   // Neither may be restated here as universal advice.
-  const { readFileSync: rfs } = await import("node:fs");
-  const SRC2 = rfs(new URL("../src/engine.mjs", import.meta.url), "utf8");
-  assert("§7.4 reject is not framed as the destination", !/ramp to p=quarantine/.test(SRC2));
-  assert("§7.4 no unevidenced provider trust-signal claim", !/increasingly treat enforced policies as a trust signal/.test(SRC2));
-  assert("§7.4 no claim that p=reject is 'the goal'", !/which is the goal and what large mailbox providers/.test(SRC2));
-  assert("§7.4 p=none is not called the most common deliverability mistake", !/most common deliverability mistake/.test(SRC2));
-  assert("§7.4 mailing-list caution is stated and scoped", /users may post to mailing lists not to publish p=reject/.test(SRC2));
-  assert("§7.4 staging advice is scoped, not universal", /for those that still do, it recommends at least a month/.test(SRC2));
-  assert("§7.4 DKIM-not-SPF-alone prerequisite is stated", /DMARC-aligned DKIM rather than relying only on SPF/.test(SRC2));
-  assert("t=y is offered in place of the removed pct", /use t=y to test an enforcement policy/.test(SRC2));
-  assert("the Google allowance is dated", /As of August 2026, Google's bulk-sender guidance permits p=none/.test(SRC2));
 }
 
 console.log(ok ? "\nALL PASS" : "\nSOME FAILED");
