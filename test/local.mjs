@@ -17,7 +17,7 @@ import {
   renderSummary,
   summaryOutput,
 } from "../src/index.mjs";
-import { auditDomain } from "../src/engine.mjs";
+import { auditDomain } from "../vendor/amino-audit-engine/engine.mjs";
 
 let pass = 0;
 let fail = 0;

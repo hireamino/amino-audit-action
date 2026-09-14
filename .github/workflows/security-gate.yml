@@ -17,6 +17,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Run gitleaks (checksum-verified)
         env:
@@ -36,6 +37,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Node
         uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
@@ -48,6 +52,15 @@ jobs:
       - name: Run conformance checks (correctness spec)
         run: node test/conformance.mjs
 
+      - name: Verify shipped engine provenance and Action wiring
+        run: node test/engine-source-contract.mjs
+
+      - name: Canary shipped-artifact and request-scoped wiring gates
+        run: node test/action-migration-canary.mjs
+
+      - name: Verify every remote workflow action is SHA-pinned
+        run: node test/workflow-action-pins.mjs
+
       # The pin script is what decides which remote code runs on this runner, so it is
       # canaried here rather than trusted from a laptop: every guard must reject the case
       # it exists for, a healthy pin must still be accepted, and the case count is pinned
@@ -55,17 +68,79 @@ jobs:
       - name: Canary the pinned-fetch guards
         run: bash scripts/canary-fetch-pinned-skills.sh
 
+      - name: Canary the canonical-engine pinned-fetch guards
+        run: bash scripts/canary-fetch-pinned-engine.sh
+
+      - name: Fetch canonical engine and prove shipped byte identity
+        run: bash scripts/verify-pinned-engine.sh /tmp/amino-audit-engine
+
       - name: Clone amino-skills at the pinned revision (public, token-free)
         run: scripts/fetch-pinned-skills.sh /tmp/amino-skills
 
       - name: Fixtures-driven conformance runner (shared corpus — hard gate)
         env:
-          ENGINE: ${{ github.workspace }}/src/engine.mjs
+          ENGINE: ${{ github.workspace }}/vendor/amino-audit-engine/engine.mjs
           SURFACE: action
         run: node /tmp/amino-skills/conformance/run.mjs
 
       - name: Mutation canaries (material contract — hard gate)
         env:
-          ENGINE: ${{ github.workspace }}/src/engine.mjs
+          ENGINE: ${{ github.workspace }}/vendor/amino-audit-engine/engine.mjs
           SURFACE: action
         run: node /tmp/amino-skills/conformance/canary.mjs
+
+      - name: Network-denied shared corpus (zero ambient fetches)
+        env:
+          ENGINE: ${{ github.workspace }}/vendor/amino-audit-engine/engine.mjs
+          RUNNER: /tmp/amino-skills/conformance/run.mjs
+          SURFACE: action
+          EXPECT_FETCH_CALLS: "0"
+        run: node test/engine-network-denied.mjs
+
+      - name: Findings inventory (12 areas, 38 action labels)
+        env:
+          PARITY_PY: /tmp/amino-skills/amino-deliverability-audit/skills/amino-deliverability-audit/scripts/audit.py
+          PARITY_JS: ${{ github.workspace }}/vendor/amino-audit-engine/engine.mjs
+        run: node /tmp/amino-skills/web-parity/inventory.mjs
+
+      - name: Export immutable pre-migration Action engine
+        run: |
+          git show ae04a363f76da800ac6d98a3647cf5bf5ab7e44a:src/engine.mjs > /tmp/action-engine-ae04a36.mjs
+          git show ae04a363f76da800ac6d98a3647cf5bf5ab7e44a:src/index.mjs > /tmp/action-index-ae04a36.mjs
+          git show ae04a363f76da800ac6d98a3647cf5bf5ab7e44a:action.yml > /tmp/action-ae04a36.yml
+
+      - name: Action inputs, outputs, rendering and exit behavior are unchanged
+        env:
+          BASELINE_INDEX: /tmp/action-index-ae04a36.mjs
+          BASELINE_ACTION: /tmp/action-ae04a36.yml
+        run: node test/host-surface-equivalence.mjs
+
+      - name: Engine equivalence and eight boundary cases
+        env:
+          SKILLS_DIR: /tmp/amino-skills
+          BASELINE_ENGINE: /tmp/action-engine-ae04a36.mjs
+          ENGINE: ${{ github.workspace }}/vendor/amino-audit-engine/engine.mjs
+        run: node test/engine-equivalence.mjs
+
+      - name: Boundary mutation canaries
+        env:
+          SKILLS_DIR: /tmp/amino-skills
+          BASELINE_ENGINE: /tmp/action-engine-ae04a36.mjs
+          ENGINE: ${{ github.workspace }}/vendor/amino-audit-engine/engine.mjs
+        run: node test/engine-boundary-canary.mjs
+
+      - name: Production wiring equivalence and per-audit adapter lifetime
+        env:
+          BASELINE_ENGINE: /tmp/action-engine-ae04a36.mjs
+          ENGINE: ${{ github.workspace }}/vendor/amino-audit-engine/engine.mjs
+        run: node test/production-wiring.mjs
+
+      - name: SSRF and ambient-access confinement
+        env:
+          ENGINE: ${{ github.workspace }}/vendor/amino-audit-engine/engine.mjs
+        run: |
+          node test/engine-ssrf.mjs
+          node test/engine-purity.mjs
+
+      - name: Execute Action entrypoint from a clean clone
+        run: bash scripts/run-clean-clone-action.sh "$(git rev-parse HEAD)"

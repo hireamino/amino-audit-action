@@ -8,7 +8,7 @@
 // All logic that doesn't touch the network is exported so test/local.mjs can
 // unit-test it with a stub resolver / synthetic findings.
 
-import { auditDomain } from "./engine.mjs";
+import { createAuditEngine, createDefaultAdapters } from "../vendor/amino-audit-engine/engine.mjs";
 
 // ── Severity model ────────────────────────────────────────────────────────────
 // Worst-first ordering. `pass` is not a failable severity.
@@ -35,7 +35,8 @@ export function parseDomains(raw, cap = MAX_DOMAINS) {
   return out;
 }
 
-// Loose syntactic gate (the engine re-validates strictly via its own DOMAIN_RE).
+// Loose syntactic gate for Action input hygiene; the canonical engine expects a
+// validated domain and does not independently apply this DOMAIN_RE.
 // Must have a dot, only DNS-legal chars, <=253 chars, labels 1..63, no leading '-'.
 export function looksLikeDomain(d) {
   if (!d || d.length > 253 || !d.includes(".")) return false;
@@ -344,7 +345,9 @@ export async function run() {
   const results = [];
   for (const domain of domains) {
     try {
-      const r = await auditDomain(domain);
+      // The default adapters cache DNS for their lifetime with no TTL. Constructing
+      // both inside the audit call prevents stale state crossing domains or runs.
+      const r = await createAuditEngine(createDefaultAdapters()).auditDomain(domain);
       results.push(r);
     } catch (e) {
       // One bad domain must not abort the run — record it as an inconclusive audit

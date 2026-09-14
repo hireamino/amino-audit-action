@@ -1,38 +1,3 @@
-// VENDORED frozen copy of cisoventures/amino-site functions/audit.js — DO NOT edit here; re-sync from source. Parity-tracked.
-/**
- * /audit — the "Try Amino" lead magnet.
- *
- * Cloudflare Pages Function (Workers runtime, fetch-only). Domain in → DNS-based
- * email-trust posture audit over DoH → renders the LOCKED effort×value plan-card
- * (assets/plan-card.html) as the result, plus FAQPage JSON-LD for on-domain GEO.
- *
- * This is a hand-port of the skill's scripts/audit.py + batch_score.py DNS logic.
- * The edge can't spawn `dig` or open a raw :25 socket, so:
- *   - DNS lookups go over DoH (cloudflare-dns.com/dns-query) — same query() contract
- *     as resolver.py, which was built with set_backend() exactly for this.
- *   - the live STARTTLS:25 probe is DROPPED (the skill already treats it as a
- *     false-negative and relies on DNS-derived buckets DANE/MTA-STS/TLS-RPT).
- *   - the MTA-STS *policy* file is still fetched over HTTPS via fetch().
- *
- * Parity: buckets() mirrors batch_score.py's score()+gap exactly (the DNS-only,
- * edge-safe subset). It's exported so a golden-set harness can diff JS↔Python.
- *
- * Security: server-side input validation (mirrors DOMAIN_RE), every DNS-derived
- * value HTML-escaped before echo (XSS), KV per-IP rate limit (fail-open), no secrets.
- */
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Config / constants  (kept in lockstep with audit.py)
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Untrusted input. A real DNS hostname: rejects whitespace, control chars, a
-// leading '-' (dig flag-injection in the skill; harmless here but keep parity), >253.
-const DOMAIN_RE = /^(?=.{1,253}$)(?!-)[a-z0-9-]{1,63}(?<!-)(?:\.(?!-)[a-z0-9-]{1,63}(?<!-))+$/;
-
-const RL_MAX = 5;        // audits per IP …
-const RL_WINDOW = 3600;  // … per hour
-const RL_TTL = 3700;     // KV key lifetime (a touch over the window)
-
 const MAX_DKIM_CONCURRENCY = 12;
 
 const DKIM_SELECTORS = [
@@ -80,17 +45,6 @@ const AI_BOTS = [
 // Small utilities
 // ─────────────────────────────────────────────────────────────────────────────
 
-function esc(s) {
-  return String(s == null ? "" : s)
-    .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;").replaceAll("'", "&#39;");
-}
-
-function safeDomain(raw) {
-  const d = (raw || "").trim().replace(/^[.@]+/, "").replace(/\.+$/, "").toLowerCase();
-  return d && d.length <= 253 && DOMAIN_RE.test(d) ? d : null;
-}
-
 async function mapPool(items, limit, fn) {
   const out = new Array(items.length);
   let i = 0;
@@ -106,7 +60,36 @@ async function mapPool(items, limit, fn) {
 // Per-request cache (stores in-flight promises so concurrent checks dedupe).
 // ─────────────────────────────────────────────────────────────────────────────
 
-function makeResolver() {
+export const contractVersion = "1.1.0";
+
+const UNAVAILABLE_HTTP = Object.freeze({
+  mtaSts: async () => null,
+  robots: async () => null,
+  rdap: async () => null,
+});
+
+const UNUSED_CLOCK = Object.freeze({ nowMs: () => 0 });
+
+function queryFromDns(dns) {
+  if (!dns || typeof dns.query !== "function") throw new TypeError("dns.query must be a function");
+  const query = (name, rrtype) => dns.query(name, rrtype);
+  if (typeof dns.meta === "function") {
+    query.meta = (name, rrtype) => dns.meta(name, rrtype);
+  }
+  return query;
+}
+
+function dnsFromLegacyQuery(query) {
+  return {
+    query: (name, rrtype) => query(name, rrtype),
+    meta: typeof query.meta === "function" ? (name, rrtype) => query.meta(name, rrtype) : undefined,
+  };
+}
+
+// The only ambient-I/O boundary in this module. Production in-process consumers
+// may pass these adapters explicitly to createAuditEngine(); compatibility calls
+// without a resolver use the same factory so there is one real implementation.
+export function createDefaultAdapters() {
   const cache = new Map();
   const metaCache = new Map(); // "type name" -> { status, ad, error }
   async function raw(name, rrtype) {
@@ -137,17 +120,48 @@ function makeResolver() {
     }
     return rows.map((r) => String(r).trim());
   }
-  function query(name, rrtype) {
-    const k = rrtype + " " + name;
-    if (!cache.has(k)) cache.set(k, raw(name, rrtype));
-    return cache.get(k);
-  }
-  // DNSSEC/rcode meta for a lookup: { status, ad, error }. Ensures the lookup ran first.
-  query.meta = async (name, rrtype) => {
-    await query(name, rrtype);
-    return metaCache.get(rrtype + " " + name) || { status: null, ad: false, error: true };
+  const dns = {
+    query(name, rrtype) {
+      const k = rrtype + " " + name;
+      if (!cache.has(k)) cache.set(k, raw(name, rrtype));
+      return cache.get(k);
+    },
+    async meta(name, rrtype) {
+      await dns.query(name, rrtype);
+      return metaCache.get(rrtype + " " + name) || { status: null, ad: false, error: true };
+    },
   };
-  return query;
+  const http = {
+    async mtaSts(domain) {
+      try {
+        const res = await fetch("https://mta-sts." + domain + "/.well-known/mta-sts.txt", {
+          signal: AbortSignal.timeout(3000), redirect: "manual",
+        });
+        const contentType = res.headers.get("content-type") || "";
+        const body = res.status === 200 && contentType.toLowerCase().includes("text/plain")
+          ? await res.text() : "";
+        return { status: res.status, contentType, body };
+      } catch (e) { return null; }
+    },
+    async robots(domain) {
+      try {
+        const res = await fetch("https://" + domain + "/robots.txt", {
+          signal: AbortSignal.timeout(3000), redirect: "manual",
+        });
+        return { status: res.status, body: res.ok ? await res.text() : "" };
+      } catch (e) { return null; }
+    },
+    async rdap(domain) {
+      try {
+        const res = await fetch("https://rdap.org/domain/" + encodeURIComponent(domain), {
+          signal: AbortSignal.timeout(3000), headers: { accept: "application/rdap+json" },
+        });
+        return res.ok ? await res.json() : null;
+      } catch (e) { return null; }
+    },
+  };
+  const clock = { nowMs: () => Date.now() };
+  return { dns, http, clock };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -187,11 +201,6 @@ function orgBase(host) {
 async function isVoid(name, q) {
   if ((await q(name, "TXT")).length) return false;
   return !(await q(name, "A")).length;
-}
-
-async function resolves(domain, q) {
-  for (const rr of ["NS", "SOA", "A"]) if ((await q(domain, rr)).length) return true;
-  return false;
 }
 
 // ── SSRF guard: reject hostnames that resolve to private/internal/metadata IPs ──
@@ -631,19 +640,18 @@ async function checkDmarc(domain, F, q) {
 
 // ── MTA-STS (DNS TXT + HTTPS policy fetch) ───────────────────────────────────
 
-async function fetchMtaStsPolicy(domain, env, q) {
-  // SSRF: the host is mta-sts.<validated-domain>, but DOMAIN_RE only checks syntax —
-  // so reject before fetch unless mta-sts.<domain> resolves to public IP(s) only.
+async function fetchMtaStsPolicy(domain, q, http, dns) {
+  // SSRF: host adapters validate domain syntax, but a valid-looking hostname can still
+  // resolve internally. Reject unless mta-sts.<domain> resolves to public IP(s) only.
   // Short timeout + size cap. redirect:"manual" — don't chase a redirect off-host.
   try {
-    if (!(await resolvesPublic("mta-sts." + domain, env, q))) return null; // fail-closed
-    const res = await fetch("https://mta-sts." + domain + "/.well-known/mta-sts.txt", {
-      signal: AbortSignal.timeout(3000), redirect: "manual",
-    });
+    if (!(await resolvesPublic("mta-sts." + domain, null, q))) return null; // fail-closed
+    const res = await http.mtaSts(domain, dns);
+    if (!res) return null;
     // RFC 8461 §3.3: the policy MUST be served as HTTP 200 with Content-Type text/plain.
     if (res.status !== 200) return null;
-    if (!(res.headers.get("content-type") || "").toLowerCase().includes("text/plain")) return null;
-    return (await res.text()).slice(0, 8192);
+    if (!(res.contentType || "").toLowerCase().includes("text/plain")) return null;
+    return String(res.body || "").slice(0, 8192);
   } catch (e) {
     return null;
   }
@@ -666,7 +674,7 @@ export function mtaStsPolicyProblems(policy) {
   return { problems, mode, maxAge, polMx };
 }
 
-async function checkMtaSts(domain, F, q) {
+async function checkMtaSts(domain, F, q, http, dns) {
   const txt = await firstTxt("_mta-sts." + domain, "v=stsv1", q);
   if (!txt) {
     F.push({ area: "MTA-STS", severity: "medium", title: "No MTA-STS policy",
@@ -674,7 +682,7 @@ async function checkMtaSts(domain, F, q) {
       fix: "Publish _mta-sts TXT (v=STSv1; id=...) and host https://mta-sts.<domain>/.well-known/mta-sts.txt. Stage it: publish TLS-RPT first so you get failure reports, start at mode: testing, confirm every production AND backup MX passes TLS, then switch to mode: enforce (RFC 8461 provides testing mode for exactly this)." });
     return;
   }
-  const policy = await fetchMtaStsPolicy(domain, null, q);
+  const policy = await fetchMtaStsPolicy(domain, q, http, dns);
   if (!policy) {
     F.push({ area: "MTA-STS", severity: "medium", title: "MTA-STS TXT present but policy file not retrievable",
       detail: "The _mta-sts TXT record advertises a policy, but https://mta-sts." + domain + "/.well-known/mta-sts.txt did not return a valid policy (RFC 8461 requires HTTP 200 with Content-Type text/plain). Senders can't fetch it, so MTA-STS isn't actually enforced.",
@@ -835,16 +843,14 @@ async function checkDnssec(domain, F, q) {
 // ── Domain age / expiry via RDAP (one HTTPS call, 3s cap, fail-open) ─────────
 // RDAP is the modern WHOIS (HTTPS/JSON); legacy WHOIS:43 isn't reachable at the edge.
 
-async function checkDomainAge(domain, F) {
+async function checkDomainAge(domain, F, http, clock) {
   let data;
   try {
-    const res = await fetch("https://rdap.org/domain/" + encodeURIComponent(domain),
-      { signal: AbortSignal.timeout(3000), headers: { accept: "application/rdap+json" } });
-    if (!res.ok) return;            // no RDAP for this TLD / not found → say nothing
-    data = await res.json();
+    data = await http.rdap(domain);
+    if (!data) return;              // no RDAP for this TLD / not found → say nothing
   } catch (e) { return; }           // fail-open: never extend the latency budget
   const events = Array.isArray(data && data.events) ? data.events : [];
-  const now = Date.now();
+  const now = clock.nowMs();
   const reg = events.find((e) => e.eventAction === "registration");
   if (reg && reg.eventDate) {
     const age = Math.floor((now - Date.parse(reg.eventDate)) / 86400000);
@@ -896,17 +902,17 @@ function robotsBlocksAiBots(txt) {
   });
 }
 
-async function checkAiBots(domain, F, q) {
+async function checkAiBots(domain, F, q, http, dns) {
   let txt;
   try {
-    // SSRF: gate on post-resolution IP — DOMAIN_RE is syntax-only, so the host could
-    // resolve to a private/metadata address. Fail-closed (skip the check) if not public.
+    // SSRF: syntax validation alone cannot stop a host resolving to a private/metadata
+    // address. Fail-closed (skip the check) if the post-resolution IP is not public.
     if (!(await resolvesPublic(domain, null, q))) return;
     // redirect:"manual" — the host is attacker-controllable, so don't chase a redirect
     // to an internal/metadata URL (defense-in-depth + parity with the skill's no-follow).
-    const res = await fetch("https://" + domain + "/robots.txt", { signal: AbortSignal.timeout(3000), redirect: "manual" });
-    if (!res.ok) return;            // no robots.txt / redirect → nothing is blocked → no finding
-    txt = (await res.text()).slice(0, 20000);
+    const res = await http.robots(domain, dns);
+    if (!res || res.status < 200 || res.status >= 300) return; // no robots.txt / redirect → no finding
+    txt = String(res.body || "").slice(0, 20000);
   } catch (e) { return; }
   const blocked = robotsBlocksAiBots(txt);
   if (blocked.length) {
@@ -1057,8 +1063,7 @@ function action(f) {
 
 const SEV_ORDER = { critical: 0, high: 1, medium: 2, low: 3, pass: 4 };
 
-export async function auditDomain(domain, q) {
-  q = q || makeResolver();
+async function auditDomainWithPorts(domain, q, http, clock, dns) {
   const spf = [], dkim = [], dmarc = [], mta = [], simple = [], transport = [], mxh = [],
     dnssec = [], rep = [], aibots = [], rdns = [], caa = [];
   let mxHost = null;
@@ -1066,13 +1071,13 @@ export async function auditDomain(domain, q) {
     checkSpf(domain, spf, q),
     checkDkim(domain, dkim, q),
     checkDmarc(domain, dmarc, q),
-    checkMtaSts(domain, mta, q),
+    checkMtaSts(domain, mta, q, http, dns),
     checkSimple(domain, simple, q),
     checkTransport(domain, transport, q).then((h) => { mxHost = h; }),
     checkMxHygiene(domain, mxh, q),
     checkDnssec(domain, dnssec, q),
-    checkDomainAge(domain, rep),
-    checkAiBots(domain, aibots, q),
+    checkDomainAge(domain, rep, http, clock),
+    checkAiBots(domain, aibots, q, http, dns),
     checkReverseDns(domain, rdns, q),
     checkCaa(domain, caa, q),
   ]);
@@ -1120,8 +1125,7 @@ export async function auditDomain(domain, q) {
 
 // batch_score.py parity surface — the DNS-only, edge-safe Y/N/N/A buckets + gap.
 // Exported for the golden-set parity harness (diff vs Python batch_score.py).
-export async function buckets(domain, q) {
-  q = q || makeResolver();
+async function bucketsWithQuery(domain, q) {
   const r = { SPF: false, DMARC: false, DMARC_enforced: false, DMARC_rua: false, MTA_STS: false, TLS_RPT: false, DANE: false, BIMI: false };
   const note = [];
 
@@ -1178,459 +1182,34 @@ export async function buckets(domain, q) {
   return { ...r, gap, note: note.length ? note.join("; ") : "clean" };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Rendering — the LOCKED plan-card (assets/plan-card.html) + page chrome
-// ─────────────────────────────────────────────────────────────────────────────
-
-const PLAN_CARD = `<style>
-.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);border:0;}
-.amino-plan{font-family:'Inter',system-ui,-apple-system,sans-serif;color:#0C2A37;background:linear-gradient(180deg,#E7F3F8,#F7FBFC 65%);border:1px solid rgba(12,42,55,0.12);border-radius:18px;padding:26px 28px;max-width:680px;margin:0 auto;}
-.amino-plan *{box-sizing:border-box;}
-.ap-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;}
-.ap-word{display:inline-flex;align-items:center;gap:8px;font-weight:700;font-size:17px;letter-spacing:-0.01em;}
-.ap-dot{width:10px;height:10px;border-radius:50%;background:linear-gradient(95deg,#F2671F,#F59331);box-shadow:0 0 0 4px rgba(242,103,31,0.16);}
-.ap-tag{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#5E7D8B;}
-.ap-title{font-family:'Newsreader',Georgia,serif;font-size:27px;font-weight:500;line-height:1.12;margin:0 0 3px;}
-.ap-sub{font-size:13px;color:#5E7D8B;margin-bottom:18px;}
-.ap-sub code{font-family:ui-monospace,SFMono-Regular,monospace;color:#1C7FAE;}
-.ap-matrix{display:grid;grid-template-columns:20px 1fr 1fr;grid-template-rows:1fr 1fr;column-gap:10px;row-gap:12px;}
-.ap-yl{display:flex;align-items:center;justify-content:center;}
-.ap-yl span{writing-mode:vertical-rl;transform:rotate(180deg);font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#5E7D8B;}
-.ap-q{border-radius:12px;padding:13px 15px;border:1px solid rgba(12,42,55,0.10);min-height:122px;}
-.ap-qh{display:flex;align-items:center;gap:7px;font-weight:600;font-size:14px;margin-bottom:11px;}
-.ap-qh>i{font-size:17px;}
-.ap-qh .lbl{margin-left:auto;font-size:10px;font-weight:500;letter-spacing:.05em;text-transform:uppercase;color:#5E7D8B;white-space:nowrap;}
-.ap-q ul{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:7px;}
-.ap-q li{font-size:13px;line-height:1.4;display:flex;gap:7px;align-items:flex-start;}
-.ap-q li>i{font-size:13px;flex:0 0 auto;position:relative;top:2px;}
-.ap-q code{font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;background:rgba(12,42,55,0.06);padding:1px 5px;border-radius:5px;}
-.ap-ok{color:#5E7D8B;font-style:italic;}
-.q-win{background:rgba(242,103,31,0.09);border-color:rgba(242,103,31,0.30);}
-.q-win .ap-qh{color:#BC4A12;}
-.q-maj{background:rgba(43,166,214,0.12);border-color:rgba(43,166,214,0.32);}
-.q-maj .ap-qh,.q-maj li>i{color:#155E82;}
-.q-fill{background:rgba(12,42,55,0.035);}
-.q-fill .ap-qh,.q-fill li>i{color:#5E7D8B;}
-.q-sec{background:rgba(28,127,174,0.06);border-color:rgba(28,127,174,0.22);}
-.q-sec .ap-qh,.q-sec li,.q-sec li>i{color:#5E7D8B;}
-.ap-xax{display:flex;align-items:center;justify-content:center;font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#5E7D8B;padding:2px 4px 0;}
-.ap-foot{display:flex;align-items:center;gap:16px;margin-top:20px;padding-top:16px;border-top:1px solid rgba(12,42,55,0.12);}
-.ap-foot p{margin:0;font-size:13px;line-height:1.45;flex:1;}
-.ap-pill{flex:0 0 auto;background:#F2671F;color:#fff;font-weight:600;font-size:13px;text-decoration:none;padding:9px 17px;border-radius:999px;white-space:nowrap;}
-.ap-ph{color:#5E7D8B;font-style:italic;opacity:.7;}
-@media (max-width:560px){
-.amino-plan{padding:16px 14px;border-radius:14px;}
-.ap-top{margin-bottom:12px;}
-.ap-word{font-size:15px;}
-.ap-tag{font-size:9.5px;letter-spacing:.1em;}
-.ap-title{font-size:20px;}
-.ap-sub{margin-bottom:13px;font-size:12px;}
-.ap-matrix{grid-template-columns:12px 1fr 1fr;column-gap:6px;row-gap:7px;}
-.ap-yl span{font-size:8px;letter-spacing:.06em;}
-.ap-q{padding:9px 9px;min-height:90px;border-radius:10px;}
-.ap-qh{font-size:11.5px;gap:4px;margin-bottom:7px;}
-.ap-qh>i{font-size:13px;}
-.ap-qh .lbl{display:none;}
-.ap-q ul{gap:5px;}
-.ap-q li{font-size:11px;line-height:1.3;gap:4px;}
-.ap-q li>i{font-size:11px;top:1px;}
-.ap-xax{font-size:8px;letter-spacing:.06em;}
-.ap-foot{gap:10px;margin-top:14px;padding-top:12px;}
-.ap-foot p{font-size:12px;}
-.ap-pill{font-size:12px;padding:8px 14px;}
-}
-</style>
-<h2 class="sr-only">Amino's agentic improvement plan for {{DOMAIN}}, a 2x2 matrix ranking email fixes by effort and value.</h2>
-<div class="amino-plan">
-  <div class="ap-top">
-    <span class="ap-word"><span class="ap-dot" aria-hidden="true"></span>HireAmino</span>
-    <span class="ap-tag">Email deliverability assessment</span>
-  </div>
-  <div class="ap-title">Amino's Agentic improvement plan</div>
-  <div class="ap-sub">{{SUB}}</div>
-  <div class="ap-matrix">
-    <div class="ap-yl" style="grid-column:1;grid-row:1;"><span>high value</span></div>
-    <div class="ap-q q-win" style="grid-column:2;grid-row:1;">
-      <div class="ap-qh"><i class="ti ti-bolt" aria-hidden="true"></i> Quick wins <span class="lbl">do first</span></div>
-      <ul>{{Q_WIN}}</ul>
-    </div>
-    <div class="ap-q q-maj" style="grid-column:3;grid-row:1;">
-      <div class="ap-qh"><i class="ti ti-tools" aria-hidden="true"></i> Major projects <span class="lbl">plan</span></div>
-      <ul>{{Q_MAJ}}</ul>
-    </div>
-    <div class="ap-yl" style="grid-column:1;grid-row:2;"><span>low value</span></div>
-    <div class="ap-q q-fill" style="grid-column:2;grid-row:2;">
-      <div class="ap-qh"><i class="ti ti-broom" aria-hidden="true"></i> Fill-ins <span class="lbl">spare time</span></div>
-      <ul>{{Q_FILL}}</ul>
-    </div>
-    <div class="ap-q q-sec" style="grid-column:3;grid-row:2;">
-      <div class="ap-qh"><i class="ti ti-shield" aria-hidden="true"></i> Hardening <span class="lbl">when required</span></div>
-      <ul>{{Q_HARD}}</ul>
-    </div>
-    <div class="ap-xax" style="grid-column:2;grid-row:3;">low effort</div>
-    <div class="ap-xax" style="grid-column:3;grid-row:3;">high effort</div>
-  </div>
-  <div class="ap-foot">
-    <p>Let Amino agents monitor and manage your email infrastructure.</p>
-    <a class="ap-pill" href="{{MONITOR}}">Try Amino</a>
-  </div>
-</div>`;
-
-function liGap(f) {
-  // Locked: one bullet = the canonical action verbatim, nothing appended.
-  return '<li><i class="ti ti-chevron-right" aria-hidden="true"></i> ' + esc(f.action) + "</li>";
-}
-
-// Renders the 2x2. findings=null → empty "expectation-setting" skeleton (form page);
-// findings=array → populated plan (result page). Same locked card, two states.
-function renderMatrix(domain, findings) {
-  let win, maj, fill, hard, sub, dom;
-  if (findings) {
-    const gaps = findings.filter((f) => f.severity !== "pass");
-    const byQuad = { "low,high": [], "high,high": [], "low,low": [], "high,low": [] };
-    for (const f of gaps) byQuad[f.effort + "," + f.value].push(f);
-    // An empty quadrant means "nothing landed in THIS quadrant" — it does NOT license a
-    // claim about the whole domain. Until 2026-07-30 the fallbacks here asserted
-    // "All solid — SPF, DKIM & DMARC enforced" and "posture is sound" whenever their
-    // quadrant happened to be empty, regardless of what sat in the other three. On
-    // gmail.com (p=none, and its one discoverable selector carrying a revoked empty p=)
-    // that produced a report claiming DMARC was enforced directly above its own
-    // recommendations to ramp DMARC to p=reject and to confirm DKIM signing. One
-    // contradiction on the summary line discredits every finding under it.
-    // So: quadrant placeholders describe the quadrant, and the all-clear is stated ONLY
-    // when there are genuinely no gaps anywhere.
-    const clean = gaps.length === 0;
-    const allClear = '<li class="ap-ok"><i class="ti ti-check" aria-hidden="true"></i> No gaps found in any checked area</li>';
-    const emptyQuad = (label) => '<li class="ap-ph">' + label + '</li>';
-    win = byQuad["low,high"].map(liGap).join("") || (clean ? allClear : emptyQuad("Nothing quick and high-impact — see the other quadrants"));
-    maj = byQuad["high,high"].map(liGap).join("") || (clean ? allClear : emptyQuad("Nothing big and high-impact"));
-    fill = byQuad["low,low"].map(liGap).join("");
-    hard = byQuad["high,low"].map(liGap).join("");
-    sub = 'for <code>' + esc(domain) + '</code> — ranked by effort &times; value';
-    dom = esc(domain);
-  } else {
-    win = '<li class="ap-ph">Fast, high-impact fixes</li>';
-    maj = '<li class="ap-ph">Bigger fixes worth planning</li>';
-    fill = '<li class="ap-ph">Minor cleanups</li>';
-    hard = '<li class="ap-ph">Security &amp; compliance</li>';
-    sub = 'Enter your domain above — your priorities appear here';
-    dom = 'your domain';
+export function createAuditEngine({ dns, http, clock }) {
+  const q = queryFromDns(dns);
+  for (const name of ["mtaSts", "robots", "rdap"]) {
+    if (!http || typeof http[name] !== "function") throw new TypeError("http." + name + " must be a function");
   }
-  return PLAN_CARD
-    .replaceAll("{{DOMAIN}}", dom)
-    .replace("{{SUB}}", sub)
-    .replace("{{Q_WIN}}", win)
-    .replace("{{Q_MAJ}}", maj)
-    .replace("{{Q_FILL}}", fill)
-    .replace("{{Q_HARD}}", hard)
-    .replace("{{MONITOR}}", (findings && domain) ? "/monitor?domain=" + encodeURIComponent(domain) : "/monitor");
-}
-
-// ── FAQ (from FAQ.md) → FAQPage JSON-LD + a compact visible FAQ ──────────────
-
-const FAQ = [
-  ["Why are my emails going to spam?",
-    "Almost always one of three things, in order of likelihood: authentication gaps (no aligned SPF, DKIM, and DMARC — the #1 cause and easiest to fix), sender reputation (a history of complaints, spam traps, or sending to dead addresses), and content/list hygiene (spammy copy, no unsubscribe, or unengaged recipients). A posture audit catches the authentication problems immediately."],
-  ["What's the difference between SPF, DKIM, and DMARC?",
-    "They are three layers of proving an email is really from you. SPF lists which servers may send for your domain. DKIM cryptographically signs each message against a public key in your DNS. DMARC ties SPF and DKIM together with alignment (the authenticated domain must match the visible From: address) and tells receivers what to do when checks fail. You need all three — SPF and DKIM without an enforcing DMARC policy still leaves you spoofable."],
-  ["What is the difference between p=none, p=quarantine, and p=reject?",
-    "DMARC's p= policy tells receivers how to handle mail that fails authentication. p=none is monitor-only — the domain owner offers no expression of preference. p=quarantine asks receivers to treat failures as suspicious. p=reject requests rejection of DMARC-failing mail, although receivers can still apply local policy. Which policy is appropriate depends on your mail flows. RFC 9989 §7.4 says domains with users who may post to mailing lists should not publish p=reject, and any domain using p=reject must apply valid DKIM rather than relying only on SPF. Dedicated transactional domains may face fewer indirect-mail risks, but should still verify their actual flows. For affected user-mail domains considering reject, the RFC recommends at least a month at p=none and an equally long period at p=quarantine before proceeding. As of August 2026, Google's bulk-sender guidance permits p=none. Enforcement is primarily an anti-spoofing choice, not a universal deliverability requirement."],
-  ["How do I know if my domain is ready to send cold or scaled outbound?",
-    "Valid SPF/DKIM/DMARC records are necessary but not sufficient. Watch three traps: receive-only domains (auth records do not make a forwarding-only domain send-ready), alignment (your ESP's mail must align to your domain, not the ESP's), and never sending cold or scaled outbound from your root domain — use a dedicated sending subdomain so a reputation hit on cold outreach does not poison your primary mail."],
-  ["Do I need MTA-STS, TLS-RPT, and DANE?",
-    "These are transport-security records that ensure mail to your domain travels over encrypted, authenticated connections. MTA-STS declares 'always use TLS to reach me'; TLS-RPT reports when someone fails to connect securely; DANE pins your TLS certificate in DNS (and is only trusted when your DNSSEC chain validates). They are not a deliverability lever the way DMARC is, but they are increasingly required in regulated, government, and security-conscious contexts. Treat them as hardening — do them when the requirement or buyer calls for it."],
-  ["What is BIMI and is it worth it?",
-    "BIMI shows your verified logo next to your emails in supporting inboxes (Gmail, Apple Mail, Yahoo). It requires a strong DMARC policy (quarantine or reject) as a prerequisite, and a VMC (Verified Mark Certificate) for the blue verified checkmark. It is worth it for brands sending real volume: it lifts recognition and open rates, and the DMARC prerequisite forces a strong authentication posture. High value — not just hardening."],
-  ["What are the Gmail and Yahoo sender requirements?",
-    "Since 2024, Gmail and Yahoo require bulk senders (roughly 5,000+ messages/day to their users) to authenticate with SPF and DKIM, publish a DMARC policy with alignment (Google explicitly allows that policy to be p=none — authentication is the requirement, enforcement is your choice), and keep spam-complaint rates under about 0.3%. One-click unsubscribe is required for marketing and subscribed messages specifically, not for transactional mail like receipts and alerts. Microsoft has announced similar expectations. Mail that does not comply gets throttled or junked."],
-  ["What is DMARCbis?",
-    "DMARCbis is the modernized DMARC standard, published as RFC 9989 (May 2026), which obsoletes the original DMARC (RFC 7489). The changes that matter to operators: a DNS Tree Walk replaces the Public Suffix List for determining organizational domains; np= is a new policy that applies specifically to NON-EXISTENT subdomains of your domain (set np=reject so nobody can send as a subdomain you never created). Note what it does not do: a lookalike \"cousin\" domain is a separate registration, and no DMARC policy on your domain can reach it; and pct, rf, and ri are removed. If you run DMARC across subdomains, this is worth acting on now."],
-  ["Does email need to be post-quantum ready?",
-    "Eventually yes, and the clock is public. NIST's draft guidance on the transition (IR 8547, still an initial public draft rather than final) proposes treating today's classical crypto (RSA-2048, ECC P-256) as deprecated around 2030 and disallowed after 2035 — a direction of travel, not a settled mandate. For email this shows up in transport (TLS 1.3 is the floor for hybrid post-quantum key exchange), DKIM signing (where there is as yet NO standardized post-quantum path — the PQC signature schemes are large and the IETF work is early — so the actionable move today is classical hygiene: a domain still on RSA-1024 DKIM is behind on the standard that already exists), and DNSSEC. The cheap moves now — get to TLS 1.3, rotate off RSA-1024 DKIM — are also your PQC head start."],
-  ["Do I need DNSSEC, and does it affect email?",
-    "DNSSEC cryptographically signs your DNS so the answers — including your mail records — can't be forged in transit, and it's the prerequisite for DANE. It's more a security/trust measure than a direct deliverability lever: enable it when a security review or compliance requirement calls for it, or as part of a strong overall posture. The audit flags whether your zone is signed (and its answers cryptographically validate)."],
-  ["Does my domain's age affect deliverability?",
-    "Yes. A brand-new domain has no sending reputation, so mailbox providers throttle it by default — send cold or at volume from a freshly registered domain and much of it lands in spam. Warm up gradually: start with low volume to engaged recipients and ramp over a few weeks before scaling. The audit flags a domain that's only days old."],
-  ["Can AI search engines like ChatGPT and Perplexity see my site?",
-    "Increasingly people ask AI answer engines about vendors instead of searching, and those engines use their own crawlers (GPTBot, ClaudeBot, PerplexityBot, OAI-SearchBot, Google-Extended and others). If your robots.txt blocks them, your site is invisible to those answers. The audit checks whether your robots.txt is shutting AI crawlers out, so you can decide which to allow."],
-  ["Is the audit really read-only? Does it change anything?",
-    "Yes, fully read-only — though \"read\" covers a little more than DNS, so here is the whole list. It queries your public DNS records; it fetches your published MTA-STS policy over HTTPS (that file is served over HTTPS by design, not DNS); it reads your robots.txt to check AI-crawler visibility; and it looks up your domain's registration date via public RDAP. All four are public information that any mail server or crawler can read. It drafts the exact changes for you to review, but it never touches your DNS, sends mail, or needs credentials. Nothing changes until you choose to apply a fix yourself."],
-];
-
-function faqJsonLd() {
-  const data = {
-    "@context": "https://schema.org",
-    "@type": "FAQPage",
-    mainEntity: FAQ.map(([q, a]) => ({
-      "@type": "Question", name: q,
-      acceptedAnswer: { "@type": "Answer", text: a },
-    })),
-  };
-  // JSON.stringify safely escapes </script> content for us via the replace below.
-  return '<script type="application/ld+json">' + JSON.stringify(data).replaceAll("<", "\\u003c") + "</script>";
-}
-
-function faqVisible() {
-  return '<section class="faq"><h2>Email deliverability FAQ</h2>'
-    + FAQ.map(([q, a]) => '<details><summary>' + esc(q) + '</summary><p>' + esc(a) + '</p></details>').join("")
-    + '</section>';
-}
-
-// ── Page shell ───────────────────────────────────────────────────────────────
-
-const PAGE_CSS = `
-.audit-wrap{position:relative;z-index:2;max-width:720px;margin:0 auto;padding:120px 24px 40px;}
-.audit-foot{text-align:center;color:rgba(12,42,55,0.42);font-size:12.5px;padding:8px 0 44px;}
-.audit-foot a{color:inherit;text-decoration:none;}
-.audit-foot a:hover{color:var(--orange);}
-.audit-head{text-align:center;margin-bottom:34px;}
-.audit-head h1{font-family:'Newsreader',Georgia,serif;font-weight:400;font-size:clamp(32px,5.4vw,50px);letter-spacing:-0.02em;color:var(--ink);margin:0 0 14px;}
-.audit-head p{color:var(--muted);font-size:18px;line-height:1.5;margin:0 auto;max-width:520px;}
-.audit-form{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;margin-top:30px;}
-.audit-form input{font-family:'Inter',sans-serif;font-size:16px;color:var(--ink);background:#fff;border:1px solid var(--hairline);border-radius:999px;padding:14px 22px;min-width:280px;}
-.audit-form input::placeholder{color:var(--muted);}
-.audit-form input:focus{outline:none;border-color:var(--orange);box-shadow:0 0 0 3px rgba(242,103,31,0.16);}
-.audit-form button{font-family:'Inter',sans-serif;font-weight:600;font-size:16px;color:#fff;background:var(--blue-dk);border:none;border-radius:999px;padding:14px 28px;cursor:pointer;transition:transform .15s,background .15s;}
-.audit-form button:hover{transform:translateY(-1px);background:var(--blue);}
-.audit-note{text-align:center;color:var(--muted);font-size:13px;margin-top:14px;}
-.audit-err{text-align:center;color:#BC4A12;font-size:15px;margin-top:18px;}
-.card-shell{margin:8px 0 40px;}
-.result-sub{text-align:center;color:var(--muted);font-size:15px;margin:0 0 34px;}
-.findings{margin:40px 0 8px;}
-.finding{padding:20px 0;border-bottom:1px solid var(--hairline);}
-.finding h3{font-family:'Newsreader',Georgia,serif;font-weight:500;font-size:22px;color:var(--ink);margin:0 0 4px;}
-.finding .sev{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:0 0 10px;}
-.finding p{font-size:16px;line-height:1.62;color:#24414E;margin:0 0 8px;}
-.finding .fix{color:var(--ink);}
-.finding.f-critical h3,.finding.f-high h3{color:#BC4A12;}
-.already{font-size:15px;color:var(--muted);margin:18px 0 0;line-height:1.6;}
-.seq{font-size:15px;color:var(--muted);margin:26px 0 0;line-height:1.6;font-style:italic;}
-.audit-cta{text-align:center;margin:4px 0 0;}
-.audit-cta .lead{font-family:'Newsreader',Georgia,serif;font-size:21px;line-height:1.4;color:var(--ink);margin:0 auto 12px;max-width:540px;}
-.audit-cta p{color:#24414E;font-size:16px;line-height:1.6;max-width:520px;margin:0 auto 22px;}
-.cta-btn{display:inline-block;background:var(--orange);color:#fff;font-weight:600;font-size:16px;text-decoration:none;padding:14px 28px;border-radius:999px;transition:transform .15s,box-shadow .15s;}
-.cta-btn:hover{transform:translateY(-1px);box-shadow:0 8px 22px rgba(242,103,31,0.35);}
-.again{text-align:center;margin:22px 0 0;}
-.again a{color:var(--muted);text-decoration:none;font-weight:500;font-size:14px;}
-.again a:hover{color:var(--orange);}
-.faq{margin:52px 0 0;border-top:1px solid var(--hairline);padding-top:34px;}
-.faq h2{font-family:'Newsreader',Georgia,serif;font-weight:500;font-size:26px;color:var(--ink);margin:0 0 18px;}
-.faq details{border-bottom:1px solid var(--hairline);padding:14px 0;}
-.faq summary{cursor:pointer;font-weight:600;font-size:16px;color:var(--ink);}
-.faq p{color:#24414E;font-size:15.5px;line-height:1.62;margin:12px 0 2px;}
-@media (max-width:560px){
-.audit-wrap{padding:90px 16px 72px;}
-.audit-head{margin-bottom:22px;}
-.audit-head h1{margin:0;}
-.audit-form{gap:8px;}
-.audit-form input{min-width:0;flex:1 1 100%;text-align:center;}
-.audit-form button{flex:1 1 100%;}
-.card-shell{margin:8px 0 28px;}
-.audit-cta .lead{font-size:19px;}
-.faq{margin:36px 0 0;padding-top:26px;}
-.faq h2{font-size:22px;}
-}
-`;
-
-// Frames the tool itself for answer engines ("free email deliverability checker").
-const AUDIT_APP_JSONLD = '<script type="application/ld+json">' + JSON.stringify({
-  "@context": "https://schema.org",
-  "@type": "WebApplication",
-  name: "Amino email deliverability audit",
-  url: "https://hireamino.com/audit",
-  applicationCategory: "BusinessApplication",
-  operatingSystem: "Web",
-  offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
-  description: "Free, read-only email deliverability audit. Checks SPF, DKIM, DMARC, MTA-STS, TLS-RPT, DANE and BIMI for any domain and ranks the fixes by effort and value.",
-  provider: { "@type": "Organization", name: "HireAmino", url: "https://hireamino.com/" },
-}).replaceAll("<", "\\u003c") + "</script>";
-
-function shell(title, description, bodyHtml, opts) {
-  opts = opts || {};
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>${esc(title)}</title>
-<meta name="description" content="${esc(description)}">
-<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
-<link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32.png">
-<link rel="apple-touch-icon" sizes="180x180" href="/assets/apple-touch-icon.png">
-<meta name="theme-color" content="#EAF5F9">
-<link rel="canonical" href="https://hireamino.com/audit${opts.canonicalQuery || ""}">
-<meta name="robots" content="index, follow, max-image-preview:large">
-<meta property="og:type" content="website">
-<meta property="og:title" content="${esc(title)}">
-<meta property="og:description" content="${esc(description)}">
-<meta property="og:image" content="https://hireamino.com/assets/og-card.png">
-<meta name="twitter:card" content="summary_large_image">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Newsreader:ital,opsz,wght@0,16..72,400;0,16..72,500;1,16..72,400;1,16..72,500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.31.0/dist/tabler-icons.min.css">
-<link rel="stylesheet" href="/styles.css">
-<style>${PAGE_CSS}</style>
-${faqJsonLd()}
-${AUDIT_APP_JSONLD}
-</head>
-<body>
-<header class="blog-nav">
-  <a href="/" class="wordmark"><span class="wordmark-dot" aria-hidden="true"></span>HireAmino</a>
-  <a class="cta" href="https://meetings-na2.hubspot.com/abhijit-solanki">Talk to the founders</a>
-</header>
-<main class="audit-wrap">
-${bodyHtml}
-</main>
-<footer class="audit-foot">© 2026 HireAmino · <a href="/privacy/">Privacy</a></footer>
-</body>
-</html>`;
-}
-
-function renderForm(opts) {
-  opts = opts || {};
-  const body = `
-<div class="audit-head">
-  <h1>Free email deliverability audit</h1>
-</div>
-<form class="audit-form" method="get" action="/audit">
-  <input type="text" name="domain" placeholder="yourdomain.com" aria-label="Domain to audit" autofocus
-         autocapitalize="off" autocorrect="off" spellcheck="false" required>
-  <button type="submit">Run the audit</button>
-</form>
-${opts.error ? '<p class="audit-err">' + esc(opts.error) + "</p>" : ""}
-<p class="audit-note">Read-only — we never change anything or send mail.</p>
-<div class="card-shell">${renderMatrix(null, null)}</div>
-${faqVisible()}`;
-  return shell(
-    "Free email deliverability audit — HireAmino",
-    "Run a free, read-only email deliverability audit on any domain. Check SPF, DKIM, DMARC, MTA-STS, TLS-RPT, DANE and BIMI, and get a prioritized fix plan.",
-    body, {}
-  );
-}
-
-function renderResult(domain, audit) {
-  const gaps = audit.findings.filter((f) => f.severity !== "pass").length;
-  const lead = gaps
-    ? "Here's where <code>" + esc(domain) + "</code> stands, ranked by what moves the needle first."
-    : "<code>" + esc(domain) + "</code> is in strong shape. Here's the full picture.";
-  const body = `
-<div class="card-shell">${renderMatrix(domain, audit.findings)}</div>
-<div class="audit-cta">
-  <p class="lead">${lead}</p>
-  <p>Want to know the moment any of this changes? Amino watches your domain's deliverability posture and emails you when something breaks — free.</p>
-  <a class="cta-btn" href="/monitor?domain=${encodeURIComponent(domain)}">Monitor your domain for free</a>
-  <p class="again"><a href="/audit">Audit another domain</a></p>
-</div>
-${faqVisible()}`;
-  return shell(
-    "Email deliverability audit for " + domain + " — HireAmino",
-    "Email deliverability posture for " + domain + ": SPF, DKIM, DMARC, MTA-STS, TLS-RPT, DANE and BIMI, ranked by effort and value.",
-    body, { canonicalQuery: "" }
-  );
-}
-
-function renderNR(domain) {
-  const body = `
-<div class="audit-head">
-  <h1>Couldn't find that domain</h1>
-  <p><code>${esc(domain)}</code> doesn't resolve in DNS (no NS, SOA, or A record). Check the spelling and try again — enter the bare domain, like <code>example.com</code>.</p>
-</div>
-<form class="audit-form" method="get" action="/audit">
-  <input type="text" name="domain" placeholder="yourdomain.com" aria-label="Domain to audit"
-         autocapitalize="off" autocorrect="off" spellcheck="false" required>
-  <button type="submit">Run the audit</button>
-</form>`;
-  return shell("Domain not found — HireAmino audit", "That domain did not resolve in DNS.", body, {});
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Rate limit (KV, fail-open)
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Mask an IPv6 address to its /64 prefix (first 4 hextets) so a single /64 can't
-// mint unlimited buckets by walking the host bits. IPv4 passes through unchanged.
-function rlKeyIp(ip) {
-  ip = String(ip || "").trim().toLowerCase();
-  if (!ip.includes(":")) return ip; // IPv4 unchanged
-  // Expand :: then take the first 4 hextets as the rate-limit key.
-  const dbl = ip.split("::");
-  let head = dbl[0] ? dbl[0].split(":") : [];
-  let tail = dbl.length > 1 ? (dbl[1] ? dbl[1].split(":") : []) : null;
-  let hextets;
-  if (tail === null) {
-    hextets = head;
-  } else {
-    const fill = Math.max(0, 8 - head.length - tail.length);
-    hextets = [...head, ...Array(fill).fill("0"), ...tail];
-  }
-  return hextets.slice(0, 4).map((h) => h || "0").join(":") + "::/64";
-}
-
-async function rateLimited(env, ip) {
-  if (!env || !env.RL) {
-    console.warn("RL binding missing — rate limit disabled");
-    return false; // no binding yet → fail open
-  }
-  try {
-    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(rlKeyIp(ip) + "|amino-audit"));
-    const hex = [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
-    const win = Math.floor(Date.now() / 1000 / RL_WINDOW);
-    const key = "rl:" + win + ":" + hex;
-    const cur = parseInt((await env.RL.get(key)) || "0", 10);
-    if (cur >= RL_MAX) return true;
-    await env.RL.put(key, String(cur + 1), { expirationTtl: RL_TTL });
-    return false;
-  } catch (e) {
-    return false; // KV error → fail open (availability over strictness for a lead magnet)
-  }
-}
-
-// Pages _headers only covers STATIC assets — Function responses get no headers
-// from it, so set the security headers here too (parity with the static site).
-const CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' fonts.googleapis.com cdn.jsdelivr.net; font-src fonts.gstatic.com cdn.jsdelivr.net; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'";
-
-function htmlResponse(body, status, cache) {
-  return new Response(body, {
-    status: status || 200,
-    headers: {
-      "content-type": "text/html; charset=utf-8",
-      "cache-control": cache || "no-store",
-      "content-security-policy": CSP,
-      "x-content-type-options": "nosniff",
-      "x-frame-options": "SAMEORIGIN",
-      "referrer-policy": "strict-origin-when-cross-origin",
-    },
+  if (!clock || typeof clock.nowMs !== "function") throw new TypeError("clock.nowMs must be a function");
+  return Object.freeze({
+    auditDomain: (domain) => auditDomainWithPorts(domain, q, http, clock, dns),
+    buckets: (domain) => bucketsWithQuery(domain, q),
   });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Route
-// ─────────────────────────────────────────────────────────────────────────────
+function compatibilityAdapters(q) {
+  if (!q) return createDefaultAdapters();
+  return {
+    dns: dnsFromLegacyQuery(q),
+    // A supplied legacy resolver denotes a fixture/offline caller. Purpose-specific
+    // ports may be attached for deterministic success-path tests; otherwise HTTP is
+    // unavailable, matching the historical fail-soft result without ambient I/O.
+    http: q.http || UNAVAILABLE_HTTP,
+    clock: q.clock || UNUSED_CLOCK,
+  };
+}
 
-export async function onRequestGet(context) {
-  const { request, env } = context;
-  const url = new URL(request.url);
-  const raw = url.searchParams.get("domain");
+export async function auditDomain(domain, q) {
+  return createAuditEngine(compatibilityAdapters(q)).auditDomain(domain);
+}
 
-  if (!raw) return htmlResponse(renderForm({}), 200, "public, max-age=600");
-
-  const domain = safeDomain(raw);
-  if (!domain) {
-    return htmlResponse(renderForm({ error: "That doesn't look like a domain. Try something like example.com." }), 400);
-  }
-
-  const ip = request.headers.get("CF-Connecting-IP") || "0.0.0.0";
-  if (await rateLimited(env, ip)) {
-    return htmlResponse(renderForm({ error: "You've reached the limit of 5 audits per hour. Please try again later." }), 429);
-  }
-
-  const query = makeResolver();
-  if (!(await resolves(domain, query))) {
-    return htmlResponse(renderNR(domain), 200, "no-store");
-  }
-
-  const audit = await auditDomain(domain, query);
-  // Short edge cache: a shared result link is cheap to re-serve; DNS changes slowly.
-  return htmlResponse(renderResult(domain, audit), 200, "public, max-age=300");
+export async function buckets(domain, q) {
+  return createAuditEngine(compatibilityAdapters(q)).buckets(domain);
 }
