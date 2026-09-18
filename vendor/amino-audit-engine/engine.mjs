@@ -60,7 +60,61 @@ async function mapPool(items, limit, fn) {
 // Per-request cache (stores in-flight promises so concurrent checks dedupe).
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const contractVersion = "1.1.0";
+export const contractVersion = "1.4.0";
+
+// Frozen mirror of amino-skills/conformance/address-contract.json. CI proves
+// these four lists are deeply equal to the exact reviewed skills pin, keeping
+// the corpus table as the only editable source of address-policy truth.
+export const addressContract = Object.freeze({
+  ipv4NonPublic: Object.freeze([
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+    "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
+    "192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
+    "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+  ]),
+  ipv6PublicWithin: Object.freeze(["2000::/3"]),
+  ipv6NonPublicWithinPublic: Object.freeze([
+    "2001::/23", "2001:db8::/32", "2002::/16", "3fff::/20",
+  ]),
+  ipv4MappedWithin: Object.freeze(["::ffff:0:0/96"]),
+});
+
+const AREA_LANES = Object.freeze({
+  SPF: "outbound_auth",
+  DKIM: "outbound_auth",
+  DMARC: "outbound_auth",
+  "MTA-STS": "inbound_transport",
+  "TLS-RPT": "inbound_transport",
+  Transport: "inbound_transport",
+  MX: "inbound_transport",
+  BIMI: "brand_optional",
+  CAA: "domain_posture",
+  DNSSEC: "domain_posture",
+  "AI visibility": "outside_sending_posture",
+  Reputation: "domain_posture",
+});
+
+const BUCKET_LANES = Object.freeze({
+  SPF: "outbound_auth",
+  DKIM: "outbound_auth",
+  DMARC: "outbound_auth",
+  DMARC_enforced: "outbound_auth",
+  DMARC_rua: "outbound_auth",
+  MTA_STS: "inbound_transport",
+  TLS_RPT: "inbound_transport",
+  DANE: "inbound_transport",
+  BIMI: "brand_optional",
+});
+
+function laneForFinding(finding) {
+  const title = String(finding.title || "").toLowerCase();
+  if (finding.area === "Transport" && title.includes("reverse dns")) {
+    return "outside_sending_posture";
+  }
+  const lane = AREA_LANES[finding.area];
+  if (!lane) throw new Error("unknown finding area has no lane: " + finding.area);
+  return lane;
+}
 
 const UNAVAILABLE_HTTP = Object.freeze({
   mtaSts: async () => null,
@@ -156,7 +210,10 @@ export function createDefaultAdapters() {
         const res = await fetch("https://rdap.org/domain/" + encodeURIComponent(domain), {
           signal: AbortSignal.timeout(3000), headers: { accept: "application/rdap+json" },
         });
-        return res.ok ? await res.json() : null;
+        if (!res.ok) return { status: res.status, data: null };
+        let data = null;
+        try { data = await res.json(); } catch (e) { /* response obtained; malformed body */ }
+        return { status: res.status, data };
       } catch (e) { return null; }
     },
   };
@@ -172,6 +229,23 @@ async function firstTxt(name, prefix, q) {
   const p = prefix.toLowerCase();
   for (const rec of await q(name, "TXT")) if (rec.toLowerCase().startsWith(p)) return rec;
   return null;
+}
+
+function dnsMetaFailed(meta) {
+  return !!meta?.error || ![0, 3].includes(meta?.status);
+}
+
+async function mtaStsTxtLookup(domain, q) {
+  const name = "_mta-sts." + domain;
+  const record = await firstTxt(name, "v=stsv1", q);
+  if (record || typeof q.meta !== "function") return { record, failed: false };
+  let meta;
+  try {
+    meta = await q.meta(name, "TXT");
+  } catch (e) {
+    return { record: null, failed: true };
+  }
+  return { record: null, failed: dnsMetaFailed(meta) };
 }
 
 // A pragmatic subset of the Public Suffix List: registry suffixes where the
@@ -207,54 +281,96 @@ async function isVoid(name, q) {
 // Post-resolution check — DOMAIN_RE only validates syntax, so a public-looking
 // hostname can still point at 169.254.169.254 / 127.0.0.1 / 10.x etc.
 
-function isPublicIp(ip) {
-  ip = String(ip || "").trim().toLowerCase();
-  if (!ip) return false;
-  if (ip.includes(":")) {
-    // IPv6
-    if (ip === "::1" || ip === "::") return false;            // loopback / unspecified
-    // ::ffff:0:0/96 IPv4-mapped — unwrap and re-check as v4
-    const m = ip.match(/^::ffff:(?:0:)?([0-9a-f.:]+)$/);
-    if (m) {
-      const inner = m[1];
-      if (inner.includes(".")) return isPublicIp(inner);
-      // hex form ::ffff:7f00:1 → two 16-bit groups → dotted quad from the 32 bits
-      const grps = inner.split(":").filter(Boolean);
-      if (grps.length && grps.length <= 2 && grps.every((g) => /^[0-9a-f]{1,4}$/.test(g))) {
-        let n = 0;
-        for (const g of grps) n = (n << 16) | parseInt(g, 16);
-        n = n >>> 0;
-        return isPublicIp([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join("."));
-      }
-    }
-    const head = parseInt(ip.split(":")[0] || "0", 16);
-    if ((head & 0xfe00) === 0xfc00) return false;              // fc00::/7 ULA
-    if ((head & 0xffc0) === 0xfe80) return false;              // fe80::/10 link-local
-    return true;
-  }
-  // IPv4
-  const o = ip.split(".");
-  if (o.length !== 4) return false;
-  const b = o.map((x) => parseInt(x, 10));
-  if (b.some((x) => !Number.isInteger(x) || x < 0 || x > 255)) return false;
-  if (b[0] === 0) return false;                                // 0.0.0.0/8
-  if (b[0] === 127) return false;                              // loopback 127/8
-  if (b[0] === 10) return false;                               // private 10/8
-  if (b[0] === 172 && b[1] >= 16 && b[1] <= 31) return false;  // private 172.16/12
-  if (b[0] === 192 && b[1] === 168) return false;              // private 192.168/16
-  if (b[0] === 169 && b[1] === 254) return false;              // link-local 169.254/16
-  if (b[0] === 100 && b[1] >= 64 && b[1] <= 127) return false; // CGNAT 100.64/10
-  return true;
+function parseIpv4Strict(text) {
+  if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(text)) return null;
+  const octets = text.split(".");
+  if (octets.some((part) => (part.length > 1 && part.startsWith("0")) || Number(part) > 255)) return null;
+  return octets.reduce((value, part) => value * 256 + Number(part), 0) >>> 0;
 }
 
-// True only if the host resolves AND every resolved A/AAAA address is public.
-// Fail-closed: no addresses, or any private/internal address → false.
-async function resolvesPublic(domain, env, q) {
+function parseIpv6Strict(text) {
+  if (!text || text.includes("%") || text.includes("/") || text.includes("[") || text.includes("]")) return null;
+  let source = text.toLowerCase();
+  if (source.includes(".")) {
+    const split = source.lastIndexOf(":");
+    if (split < 0) return null;
+    const ipv4 = parseIpv4Strict(source.slice(split + 1));
+    if (ipv4 === null) return null;
+    source = source.slice(0, split + 1)
+      + ((ipv4 >>> 16) & 0xffff).toString(16) + ":" + (ipv4 & 0xffff).toString(16);
+  }
+  const compressed = source.indexOf("::");
+  if (compressed !== source.lastIndexOf("::")) return null;
+  const rawLeft = compressed < 0 ? source : source.slice(0, compressed);
+  const rawRight = compressed < 0 ? "" : source.slice(compressed + 2);
+  if (compressed < 0 && (rawLeft.startsWith(":") || rawLeft.endsWith(":"))) return null;
+  if (compressed >= 0
+      && ((rawLeft && (rawLeft.startsWith(":") || rawLeft.endsWith(":")))
+        || (rawRight && (rawRight.startsWith(":") || rawRight.endsWith(":"))))) return null;
+  const left = rawLeft.split(":").filter(Boolean);
+  const right = rawRight.split(":").filter(Boolean);
+  if (![...left, ...right].every((part) => /^[0-9a-f]{1,4}$/.test(part))) return null;
+  let groups;
+  if (compressed < 0) {
+    if (left.length !== 8) return null;
+    groups = left;
+  } else {
+    const fill = 8 - left.length - right.length;
+    if (fill < 1) return null;
+    groups = [...left, ...Array(fill).fill("0"), ...right];
+  }
+  let value = 0n;
+  for (const group of groups) value = (value << 16n) | BigInt(parseInt(group, 16));
+  return value;
+}
+
+function cidrContains(value, cidr, parser, width) {
+  const [rawBase, rawPrefix] = cidr.split("/");
+  const base = parser(rawBase);
+  const prefix = Number(rawPrefix);
+  if (base === null || !Number.isInteger(prefix) || prefix < 0 || prefix > width) return false;
+  const bits = BigInt(width - prefix);
+  return (BigInt(value) >> bits) === (BigInt(base) >> bits);
+}
+
+function isPublicIpv4(value) {
+  return !addressContract.ipv4NonPublic.some((cidr) => cidrContains(value, cidr, parseIpv4Strict, 32));
+}
+
+function isPublicIp(ip) {
+  const text = String(ip || "").trim().toLowerCase();
+  if (!text) return false;
+  const ipv4 = parseIpv4Strict(text);
+  if (ipv4 !== null) return isPublicIpv4(ipv4);
+  const ipv6 = parseIpv6Strict(text);
+  if (ipv6 === null) return false;
+  if (addressContract.ipv4MappedWithin.some((cidr) => cidrContains(ipv6, cidr, parseIpv6Strict, 128))) {
+    return isPublicIpv4(Number(ipv6 & 0xffffffffn));
+  }
+  return addressContract.ipv6PublicWithin.some((cidr) => cidrContains(ipv6, cidr, parseIpv6Strict, 128))
+    && !addressContract.ipv6NonPublicWithinPublic.some((cidr) => cidrContains(ipv6, cidr, parseIpv6Strict, 128));
+}
+
+// One post-resolution guard for every domain-controlled HTTP host. It reports
+// why a host was refused so callers can distinguish authoritative no-address
+// evidence from lookup failure without duplicating the address-policy path.
+async function publicAddressState(domain, env, q) {
   q = q || makeResolver();
   const [a, aaaa] = await Promise.all([q(domain, "A"), q(domain, "AAAA")]);
   const ips = [...a, ...aaaa].map((x) => String(x).trim()).filter(Boolean);
-  if (!ips.length) return false;
-  return ips.every(isPublicIp);
+  if (!ips.length) {
+    if (typeof q.meta !== "function") return "lookup_failed";
+    try {
+      const [aMeta, aaaaMeta] = await Promise.all([
+        q.meta(domain, "A"), q.meta(domain, "AAAA"),
+      ]);
+      return dnsMetaFailed(aMeta) || dnsMetaFailed(aaaaMeta)
+        ? "lookup_failed" : "no_answers";
+    } catch (e) {
+      return "lookup_failed";
+    }
+  }
+  return ips.every(isPublicIp) ? "public" : "refused";
 }
 
 function mxHosts(mxRows) {
@@ -644,16 +760,21 @@ async function fetchMtaStsPolicy(domain, q, http, dns) {
   // SSRF: host adapters validate domain syntax, but a valid-looking hostname can still
   // resolve internally. Reject unless mta-sts.<domain> resolves to public IP(s) only.
   // Short timeout + size cap. redirect:"manual" — don't chase a redirect off-host.
+  let res = null;
   try {
-    if (!(await resolvesPublic("mta-sts." + domain, null, q))) return null; // fail-closed
-    const res = await http.mtaSts(domain, dns);
-    if (!res) return null;
+    if ((await publicAddressState("mta-sts." + domain, null, q)) !== "public") {
+      return { observation: "unavailable", policy: null };
+    }
+    res = await http.mtaSts(domain, dns);
+    if (!res) return { observation: "unavailable", policy: null };
     // RFC 8461 §3.3: the policy MUST be served as HTTP 200 with Content-Type text/plain.
-    if (res.status !== 200) return null;
-    if (!(res.contentType || "").toLowerCase().includes("text/plain")) return null;
-    return String(res.body || "").slice(0, 8192);
+    if (res.status !== 200) return { observation: "checked", policy: null };
+    if (!(res.contentType || "").toLowerCase().includes("text/plain")) {
+      return { observation: "checked", policy: null };
+    }
+    return { observation: "checked", policy: String(res.body || "").slice(0, 8192) };
   } catch (e) {
-    return null;
+    return { observation: "unavailable", policy: null };
   }
 }
 
@@ -674,15 +795,28 @@ export function mtaStsPolicyProblems(policy) {
   return { problems, mode, maxAge, polMx };
 }
 
-async function checkMtaSts(domain, F, q, http, dns) {
-  const txt = await firstTxt("_mta-sts." + domain, "v=stsv1", q);
-  if (!txt) {
+async function checkMtaSts(domain, F, q, http, dns, observations) {
+  if (isNullMx(await q(domain, "MX"))) {
+    observations.mta_sts_policy = "not_applicable";
+    return;
+  }
+  const lookup = await mtaStsTxtLookup(domain, q);
+  if (lookup.failed) {
+    observations.mta_sts_policy = "unavailable";
+    F.push({ area: "MTA-STS", severity: "low", title: "Unable to confirm MTA-STS policy",
+      detail: "The DNS lookup for the _mta-sts record failed, so we could not tell whether an MTA-STS policy is published. This is not a finding that the policy is missing.",
+      fix: "Re-run the check. If it keeps failing, confirm your DNS provider answers TXT queries for _mta-sts.<domain>." });
+    return;
+  }
+  if (!lookup.record) {
+    observations.mta_sts_policy = "not_applicable";
     F.push({ area: "MTA-STS", severity: "medium", title: "No MTA-STS policy",
       detail: "MTA-STS lets you require TLS for inbound SMTP and is part of a modern transport posture (and increasingly asked for in EU procurement, and specified in BSI's guidance for secure email transport (TR-03108)). Absent it, downgrade attacks on mail-in-transit are possible.",
       fix: "Publish _mta-sts TXT (v=STSv1; id=...) and host https://mta-sts.<domain>/.well-known/mta-sts.txt. Stage it: publish TLS-RPT first so you get failure reports, start at mode: testing, confirm every production AND backup MX passes TLS, then switch to mode: enforce (RFC 8461 provides testing mode for exactly this)." });
     return;
   }
-  const policy = await fetchMtaStsPolicy(domain, q, http, dns);
+  const { observation, policy } = await fetchMtaStsPolicy(domain, q, http, dns);
+  observations.mta_sts_policy = observation;
   if (!policy) {
     F.push({ area: "MTA-STS", severity: "medium", title: "MTA-STS TXT present but policy file not retrievable",
       detail: "The _mta-sts TXT record advertises a policy, but https://mta-sts." + domain + "/.well-known/mta-sts.txt did not return a valid policy (RFC 8461 requires HTTP 200 with Content-Type text/plain). Senders can't fetch it, so MTA-STS isn't actually enforced.",
@@ -843,12 +977,16 @@ async function checkDnssec(domain, F, q) {
 // ── Domain age / expiry via RDAP (one HTTPS call, 3s cap, fail-open) ─────────
 // RDAP is the modern WHOIS (HTTPS/JSON); legacy WHOIS:43 isn't reachable at the edge.
 
-async function checkDomainAge(domain, F, http, clock) {
-  let data;
+async function checkDomainAge(domain, F, http, clock, observations) {
+  let response = null;
   try {
-    data = await http.rdap(domain);
-    if (!data) return;              // no RDAP for this TLD / not found → say nothing
-  } catch (e) { return; }           // fail-open: never extend the latency budget
+    response = await http.rdap(domain);
+  } catch (e) { /* fail-open: never extend the latency budget */ }
+  const observation = response ? "checked" : "unavailable";
+  observations.rdap = observation;
+  if (!response) return;
+  const data = response.data;
+  if (!data) return;                // no RDAP for this TLD / not found → say nothing
   const events = Array.isArray(data && data.events) ? data.events : [];
   const now = clock.nowMs();
   const reg = events.find((e) => e.eventAction === "registration");
@@ -902,18 +1040,24 @@ function robotsBlocksAiBots(txt) {
   });
 }
 
-async function checkAiBots(domain, F, q, http, dns) {
-  let txt;
+async function checkAiBots(domain, F, q, http, dns, observations) {
+  let res = null;
+  let addressState = "lookup_failed";
   try {
     // SSRF: syntax validation alone cannot stop a host resolving to a private/metadata
     // address. Fail-closed (skip the check) if the post-resolution IP is not public.
-    if (!(await resolvesPublic(domain, null, q))) return;
+    addressState = await publicAddressState(domain, null, q);
+    if (addressState === "public") {
+      res = await http.robots(domain, dns);
+    }
     // redirect:"manual" — the host is attacker-controllable, so don't chase a redirect
     // to an internal/metadata URL (defense-in-depth + parity with the skill's no-follow).
-    const res = await http.robots(domain, dns);
-    if (!res || res.status < 200 || res.status >= 300) return; // no robots.txt / redirect → no finding
-    txt = String(res.body || "").slice(0, 20000);
-  } catch (e) { return; }
+  } catch (e) { /* unavailable */ }
+  const observation = res ? "checked"
+    : addressState === "no_answers" ? "not_applicable" : "unavailable";
+  observations.robots = observation;
+  if (!res || res.status < 200 || res.status >= 300) return; // no robots.txt / redirect → no finding
+  const txt = String(res.body || "").slice(0, 20000);
   const blocked = robotsBlocksAiBots(txt);
   if (blocked.length) {
     F.push({ area: "AI visibility", severity: "low", title: "robots.txt blocks AI crawlers",
@@ -1036,6 +1180,7 @@ function action(f) {
     return "Strengthen the DMARC policy";
   }
   if (a === "MTA-STS") {
+    if (t.includes("unable to confirm")) return "Re-check the MTA-STS DNS record";
     if (t.includes("does not cover all mx")) return "Fix MTA-STS mx: entries to match your MX";
     if (t.includes("max_age")) return "Set a valid MTA-STS max_age";
     return "Publish an MTA-STS policy";
@@ -1067,17 +1212,22 @@ async function auditDomainWithPorts(domain, q, http, clock, dns) {
   const spf = [], dkim = [], dmarc = [], mta = [], simple = [], transport = [], mxh = [],
     dnssec = [], rep = [], aibots = [], rdns = [], caa = [];
   let mxHost = null;
+  const observations = {
+    mta_sts_policy: "not_applicable",
+    robots: "unavailable",
+    rdap: "unavailable",
+  };
   await Promise.all([
     checkSpf(domain, spf, q),
     checkDkim(domain, dkim, q),
     checkDmarc(domain, dmarc, q),
-    checkMtaSts(domain, mta, q, http, dns),
+    checkMtaSts(domain, mta, q, http, dns, observations),
     checkSimple(domain, simple, q),
     checkTransport(domain, transport, q).then((h) => { mxHost = h; }),
     checkMxHygiene(domain, mxh, q),
     checkDnssec(domain, dnssec, q),
-    checkDomainAge(domain, rep, http, clock),
-    checkAiBots(domain, aibots, q, http, dns),
+    checkDomainAge(domain, rep, http, clock, observations),
+    checkAiBots(domain, aibots, q, http, dns, observations),
     checkReverseDns(domain, rdns, q),
     checkCaa(domain, caa, q),
   ]);
@@ -1102,6 +1252,7 @@ async function auditDomainWithPorts(domain, q, http, clock, dns) {
     const [effort, value] = priority(f);
     f.effort = effort; f.value = value;
     if (effort) { f.quadrant = QUADRANT[effort + "," + value]; f.action = action(f); }
+    f.lane = laneForFinding(f);
   }
   const summary = {};
   for (const s of ["critical", "high", "medium", "low", "pass"]) summary[s] = F.filter((f) => f.severity === s).length;
@@ -1120,7 +1271,7 @@ async function auditDomainWithPorts(domain, q, http, clock, dns) {
       }
     }
   }
-  return { domain, primary_mx: mxHost, summary, findings: F, inconclusive, inconclusive_reason: inconclusiveReason };
+  return { domain, primary_mx: mxHost, summary, findings: F, observations, inconclusive, inconclusive_reason: inconclusiveReason };
 }
 
 // batch_score.py parity surface — the DNS-only, edge-safe Y/N/N/A buckets + gap.
@@ -1161,7 +1312,8 @@ async function bucketsWithQuery(domain, q) {
     r.TLS_RPT = null;
     r.DANE = null;
   } else {
-    r.MTA_STS = !!(await firstTxt("_mta-sts." + domain, "v=stsv1", q));
+    const mtaSts = await mtaStsTxtLookup(domain, q);
+    r.MTA_STS = mtaSts.failed ? null : !!mtaSts.record;
     r.TLS_RPT = !!(await firstTxt("_smtp._tls." + domain, "v=tlsrptv1", q));
   }
   const realMx = realMxRows(mx);
@@ -1179,7 +1331,7 @@ async function bucketsWithQuery(domain, q) {
   const bool = ["SPF", "DMARC", "DMARC_enforced", "DMARC_rua", "MTA_STS", "TLS_RPT", "DANE", "BIMI"];
   let gap = bool.filter((b) => r[b] === false).length;
   if (r.DKIM === "weak") gap += 1;
-  return { ...r, gap, note: note.length ? note.join("; ") : "clean" };
+  return { ...r, gap, note: note.length ? note.join("; ") : "clean", lanes: { ...BUCKET_LANES } };
 }
 
 export function createAuditEngine({ dns, http, clock }) {

@@ -53,7 +53,7 @@ printf '%s\n' "$REAL" > "$PIN"
 expect "healthy local pin is accepted" 0 "amino-audit-engine pinned at $REAL"
 record "$([ "$(git -C "$DEST" rev-parse HEAD 2>/dev/null)" = "$REAL" ] && echo 0 || echo 1)" \
   "healthy fetch checks out the pinned commit"
-record "$([ "$(sha256sum "$DEST/src/engine.mjs" | awk '{print $1}')" = "146a91ad5dfc047e28ade78ebe5bdf8788519b8b3b29c76b192e3a32ac7657e0" ] && echo 0 || echo 1)" \
+record "$([ "$(sha256sum "$DEST/src/engine.mjs" | awk '{print $1}')" = "978cd28742f3e5ab57293d76d8681fcb5ec3fa75d235929a05c19ac8db9e460e" ] && echo 0 || echo 1)" \
   "healthy fetch preserves canonical engine bytes"
 
 rm -f "$PIN"
