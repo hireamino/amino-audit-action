@@ -86,6 +86,11 @@ jobs:
       - name: Clone amino-skills at the pinned revision (public, token-free)
         run: scripts/fetch-pinned-skills.sh /tmp/amino-skills
 
+      - name: Measure Action outcomes across every fixture and fail-on level
+        env:
+          SKILLS_DIR: /tmp/amino-skills
+        run: node test/whi-220-action-outcomes.mjs
+
       - name: Fixtures-driven conformance runner (shared corpus — hard gate)
         env:
           ENGINE: ${{ github.workspace }}/vendor/amino-audit-engine/engine.mjs

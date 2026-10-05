@@ -1,4 +1,4 @@
 # Canonical engine revision shipped by this Action. This is deliberately separate
 # from amino-skills.pin: one selects the runtime artifact, the other selects the
 # executable conformance contract used to judge it.
-15775c593d6eddf215c4172ab72dbd43670e3f35
+41abd12470ccaa43564f8d8c9c1e350fed9d922c
