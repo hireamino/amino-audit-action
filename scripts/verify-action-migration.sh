@@ -29,9 +29,10 @@ bash scripts/verify-pinned-engine.sh "$TMP/canonical-engine"
 ENGINE_CHECKOUT="$TMP/canonical-engine" node test/engine-suite-canary.mjs
 
 scripts/fetch-pinned-skills.sh "$SKILLS_DIR"
+SKILLS_DIR="$SKILLS_DIR" node test/whi-220-action-outcomes.mjs
 SURFACE=action ENGINE="$SHIPPED_ENGINE" node "$SKILLS_DIR/conformance/run.mjs"
 SURFACE=action ENGINE="$SHIPPED_ENGINE" node "$SKILLS_DIR/conformance/canary.mjs"
 PARITY_PY="$SKILLS_DIR/amino-deliverability-audit/skills/amino-deliverability-audit/scripts/audit.py" \
   PARITY_JS="$SHIPPED_ENGINE" node "$SKILLS_DIR/web-parity/inventory.mjs"
 
-echo "ALL WHI-125 STEP 3 ACTION MIGRATION GATES PASS"
+echo "ALL WHI-220 PART B ACTION 1.5.0 GATES PASS"

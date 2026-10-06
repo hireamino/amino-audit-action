@@ -60,7 +60,7 @@ async function mapPool(items, limit, fn) {
 // Per-request cache (stores in-flight promises so concurrent checks dedupe).
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const contractVersion = "1.4.0";
+export const contractVersion = "1.5.0";
 
 // Frozen mirror of amino-skills/conformance/address-contract.json. CI proves
 // these four lists are deeply equal to the exact reviewed skills pin, keeping
@@ -1256,17 +1256,16 @@ async function auditDomainWithPorts(domain, q, http, clock, dns) {
   }
   const summary = {};
   for (const s of ["critical", "high", "medium", "low", "pass"]) summary[s] = F.filter((f) => f.severity === s).length;
-  // I20: if a CRITICAL lookup (SPF/DMARC/MX) hit a transient failure (SERVFAIL/REFUSED or
-  // a fetch error) the audit is inconclusive — those verdicts can't be trusted as "absent".
-  // Distinct from NXDOMAIN(3)/NODATA(0), which are conclusive. The Action folds this into
-  // audit-complete; other surfaces expose it for downstream consumers.
+  // I20: if a CRITICAL lookup (SPF/DMARC/MX) failed, the audit is inconclusive — those
+  // verdicts can't be trusted as "absent". Only NOERROR(0) and NXDOMAIN(3) are conclusive.
+  // The Action folds this into audit-complete; other surfaces expose it downstream.
   let inconclusive = false, inconclusiveReason = null;
   if (typeof q === "function" && q.meta) {
     for (const [n, t] of [[domain, "TXT"], ["_dmarc." + domain, "TXT"], [domain, "MX"]]) {
       const m = await q.meta(n, t);
-      if (m.error || m.status === 2 || m.status === 5) {
+      if (dnsMetaFailed(m)) {
         inconclusive = true;
-        inconclusiveReason = t + " " + n + ": " + (m.error ? "lookup error" : "SERVFAIL/REFUSED");
+        inconclusiveReason = t + " " + n + ": " + ((m.status === 2 || m.status === 5) ? "SERVFAIL/REFUSED" : "lookup error");
         break;
       }
     }

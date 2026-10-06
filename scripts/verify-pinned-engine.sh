@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DEST="${1:-/tmp/amino-audit-engine}"
 SHIPPED="$ROOT/vendor/amino-audit-engine/engine.mjs"
-EXPECTED_HASH=978cd28742f3e5ab57293d76d8681fcb5ec3fa75d235929a05c19ac8db9e460e
+EXPECTED_HASH=237f2b5e8312f9a8991592e448713c8ccf7af57985de8e76e35619ae69f8ccbb
 SKILLS_PIN_FILE="${SKILLS_PIN_FILE:-$ROOT/.github/amino-skills.pin}"
 
 "$ROOT/scripts/fetch-pinned-engine.sh" "$DEST"
