@@ -7,6 +7,10 @@ const root = process.cwd();
 const dir = mkdtempSync(join(tmpdir(), "amino-action-migration-canary-"));
 const engine = readFileSync("vendor/amino-audit-engine/engine.mjs");
 const provenance = JSON.parse(readFileSync("vendor/amino-audit-engine/provenance.json", "utf8"));
+const enginePin = readFileSync(".github/amino-audit-engine.pin", "utf8").split("\n")
+  .filter((line) => line && !line.startsWith("#")).join("").trim();
+const skillsPin = readFileSync(".github/amino-skills.pin", "utf8").split("\n")
+  .filter((line) => line && !line.startsWith("#")).join("").trim();
 const index = readFileSync("src/index.mjs", "utf8");
 const base = "996b7525234755de9ea6dc51fe5ad3b29a65f073";
 
@@ -20,6 +24,10 @@ function runContract(env = {}) {
 
 function outputOf(result) {
   return `${result.stdout || ""}\n${result.stderr || ""}`;
+}
+
+function wrongHex(value) {
+  return `${value.slice(0, -1)}${value.endsWith("0") ? "1" : "0"}`;
 }
 
 function expectContractRed(name, env, diagnostic) {
@@ -51,30 +59,30 @@ try {
     ["show", `${base}:vendor/amino-audit-engine/engine.mjs`],
     { cwd: root, encoding: "buffer" },
   );
-  if (oldArtifactResult.status !== 0) throw new Error("could not read the immutable 1.4.0 artifact");
-  const oldArtifact = join(dir, "engine-1.4.0.mjs");
+  if (oldArtifactResult.status !== 0) throw new Error("could not read the immutable prior artifact");
+  const oldArtifact = join(dir, "engine-prior.mjs");
   writeFileSync(oldArtifact, oldArtifactResult.stdout);
   expectContractRed(
-    "C5.1 engine pin bumped but artifact left at 1.4.0",
+    "C5.1 engine pin bumped but artifact left at a prior revision",
     { ENGINE_FILE: oldArtifact },
     "FAIL shipped engine byte count is pinned",
   );
 
-  const oldEnginePin = join(dir, "engine-1.4.0.pin");
-  writeFileSync(oldEnginePin, "15775c593d6eddf215c4172ab72dbd43670e3f35\n");
+  const oldEnginePin = join(dir, "wrong-engine.pin");
+  writeFileSync(oldEnginePin, `${wrongHex(enginePin)}\n`);
   expectContractRed(
-    "C5.2 artifact replaced but engine pin left at 1.4.0",
+    "C5.2 artifact paired with a wrong engine pin",
     { ENGINE_PIN_FILE: oldEnginePin },
-    "FAIL engine pin is the reviewed 1.5.0 merge SHA",
+    "FAIL engine pin is the reviewed merge SHA",
   );
 
   const staleShaProvenance = join(dir, "provenance-stale-sha.json");
   writeFileSync(staleShaProvenance, `${JSON.stringify({
     ...provenance,
-    sha256: "978cd28742f3e5ab57293d76d8681fcb5ec3fa75d235929a05c19ac8db9e460e",
+    sha256: "0".repeat(64),
   }, null, 2)}\n`);
   expectContractRed(
-    "C5.3 provenance SHA-256 left at 1.4.0",
+    "C5.3 provenance SHA-256 set to a wrong value",
     { PROVENANCE_FILE: staleShaProvenance },
     "FAIL shipped engine SHA-256 is pinned",
   );
@@ -82,20 +90,20 @@ try {
   const staleVersionProvenance = join(dir, "provenance-stale-version.json");
   writeFileSync(staleVersionProvenance, `${JSON.stringify({
     ...provenance,
-    contractVersion: "1.4.0",
+    contractVersion: `${provenance.contractVersion}-wrong`,
   }, null, 2)}\n`);
   expectContractRed(
-    "C5.4 provenance contractVersion left at 1.4.0",
+    "C5.4 provenance contractVersion set to a wrong value",
     { PROVENANCE_FILE: staleVersionProvenance },
     "FAIL contract version is pinned",
   );
 
-  const oldSkillsPin = join(dir, "skills-1.4.0.pin");
-  writeFileSync(oldSkillsPin, "2558a593ec8aacb816bf3cd91821c32433a3b341\n");
+  const oldSkillsPin = join(dir, "wrong-skills.pin");
+  writeFileSync(oldSkillsPin, `${wrongHex(skillsPin)}\n`);
   expectContractRed(
-    "C5.5 skills pin left at the 1.4.0 contract revision",
+    "C5.5 artifact paired with a wrong skills pin",
     { SKILLS_PIN_FILE: oldSkillsPin },
-    "FAIL skills pin is the engine's reviewed 1.5.0 contract pin",
+    "FAIL skills pin is the engine's reviewed contract pin",
   );
 
   const oneByteAltered = join(dir, "engine-one-byte-altered.mjs");

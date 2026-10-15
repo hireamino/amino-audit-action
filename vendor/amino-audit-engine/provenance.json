@@ -1,10 +1,10 @@
 {
   "repository": "https://github.com/hireamino/amino-audit-engine.git",
-  "revision": "41abd12470ccaa43564f8d8c9c1e350fed9d922c",
+  "revision": "f422788c0e7d0f7f2194dbb1366bf2b16a995103",
   "sourcePath": "src/engine.mjs",
   "artifactPath": "vendor/amino-audit-engine/engine.mjs",
-  "bytes": 73538,
-  "sha256": "237f2b5e8312f9a8991592e448713c8ccf7af57985de8e76e35619ae69f8ccbb",
-  "contractVersion": "1.5.0",
+  "bytes": 290979,
+  "sha256": "4b3191331745bfe14700b56fc0486ec0e22b89cd003f66f7c2361affda952de5",
+  "contractVersion": "1.6.0",
   "copyPolicy": "The committed artifact is an exact byte copy; provenance never rewrites it."
 }
