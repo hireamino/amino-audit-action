@@ -29,14 +29,14 @@ function assert(name, condition) {
   else failed += 1;
 }
 
-assert("engine pin is the reviewed 1.5.0 merge SHA", pin === "41abd12470ccaa43564f8d8c9c1e350fed9d922c");
-assert("skills pin is the engine's reviewed 1.5.0 contract pin", skillsPin === "24faecb4f0db092bfd853319b6cf66b5834073d2");
+assert("engine pin is the reviewed merge SHA", pin === "f422788c0e7d0f7f2194dbb1366bf2b16a995103");
+assert("skills pin is the engine's reviewed contract pin", skillsPin === "8dc7be0846863263016729f0794f25567e2d3212");
 assert("provenance revision equals the consumer pin", provenance.revision === pin);
 assert("provenance source path is canonical", provenance.sourcePath === "src/engine.mjs");
 assert("provenance artifact path names the shipped copy", provenance.artifactPath === "vendor/amino-audit-engine/engine.mjs");
-assert("shipped engine byte count is pinned", bytes.length === provenance.bytes && bytes.length === 73538);
-assert("shipped engine SHA-256 is pinned", sha256 === provenance.sha256 && sha256 === "237f2b5e8312f9a8991592e448713c8ccf7af57985de8e76e35619ae69f8ccbb");
-assert("contract version is pinned", provenance.contractVersion === "1.5.0" && /export const contractVersion = "1\.5\.0"/.test(source));
+assert("shipped engine byte count is pinned", bytes.length === provenance.bytes && bytes.length === 290979);
+assert("shipped engine SHA-256 is pinned", sha256 === provenance.sha256 && sha256 === "4b3191331745bfe14700b56fc0486ec0e22b89cd003f66f7c2361affda952de5");
+assert("contract version is pinned", provenance.contractVersion === "1.6.0" && /export const contractVersion = "1\.6\.0"/.test(source));
 
 // Relocated from test/conformance.mjs. These inspect the shipped canonical
 // artifact, while behavioral Action output/fail-on/finalize checks stay in their
