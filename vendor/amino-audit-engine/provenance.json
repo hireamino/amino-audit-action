@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/hireamino/amino-audit-engine.git",
-  "revision": "f422788c0e7d0f7f2194dbb1366bf2b16a995103",
+  "revision": "1ccfe113eb061de62103c46a77ab7c72c8d4a34c",
   "sourcePath": "src/engine.mjs",
   "artifactPath": "vendor/amino-audit-engine/engine.mjs",
   "bytes": 290979,
