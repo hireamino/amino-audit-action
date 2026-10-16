@@ -60,7 +60,7 @@ async function mapPool(items, limit, fn) {
 // Per-request cache (stores in-flight promises so concurrent checks dedupe).
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const contractVersion = "1.6.0";
+export const contractVersion = "1.7.0";
 
 // Frozen mirror of amino-skills/conformance/address-contract.json. CI proves
 // these four lists are deeply equal to the exact reviewed skills pin, keeping
@@ -11029,52 +11029,155 @@ async function checkDkim(domain, F, q) {
 
 // ── DMARC ────────────────────────────────────────────────────────────────────
 
-// RFC 9989 (DMARCbis) tree walk: the applicable DMARC record is the domain's own
-// _dmarc if present, otherwise the nearest ancestor's, walking up to the organizational
-// domain (bounded to 5 lookups). A subdomain with no record of its own inherits the
-// ancestor's sp (subdomain policy) if set, else its p.
+function dmarcTags(record) {
+  const tags = {};
+  for (const match of String(record || "").matchAll(/(\w+)=\s*([^;]+)/g)) {
+    tags[match[1].toLowerCase()] = match[2].trim().toLowerCase();
+  }
+  return tags;
+}
+
+// Normal organizational-domain inheritance remains bounded by the pinned Public
+// Suffix List. RFC 9989 also walks above that boundary, through the single-label
+// TLD, with at most eight total queries including the audited name. Records found
+// there are observations unless an ancestor explicitly opts in with psd=y.
 async function discoverDmarc(domain, q) {
   domain = domain.replace(/\.+$/, "").toLowerCase();
   const own = await firstTxt("_dmarc." + domain, "v=dmarc1", q);
-  if (own) return { rec: own, source: domain, inherited: false };
+  if (own) return { rec: own, source: domain, relationship: "self" };
   const base = registrableDomain(domain);
-  if (!base || domain === base) return { rec: null, source: null, inherited: false };
+  if (!base) return { rec: null, source: null, relationship: null };
   const labels = domain.split(".");
-  for (let i = 1; i <= labels.length - 2 && i <= 5; i++) {
+  const baseLabels = base.split(".").length;
+  let parentObservation = null;
+  const recordsAboveRoot = new Map();
+  const startIndex = Math.max(1, labels.length - 7);
+  for (let i = startIndex; i < labels.length; i++) {
     const parent = labels.slice(i).join(".");
     const rec = await firstTxt("_dmarc." + parent, "v=dmarc1", q);
-    if (rec) return { rec, source: parent, inherited: true };
-    if (parent === base) break; // don't walk above the organizational domain
+    if (!rec) continue;
+    const aboveRoot = parent.split(".").length < baseLabels;
+    if (!aboveRoot) return { rec, source: parent, relationship: "organizational" };
+    const psd = dmarcTags(rec).psd || "u";
+    if (psd === "y") {
+      const organizational = labels.slice(i - 1).join(".");
+      const organizationalRecord = recordsAboveRoot.get(organizational);
+      if (organizationalRecord) {
+        return { rec: organizationalRecord, source: organizational, relationship: "psd" };
+      }
+      return { rec, source: parent, relationship: "psd" };
+    }
+    recordsAboveRoot.set(parent, rec);
+    if (!parentObservation) {
+      parentObservation = { rec, source: parent, relationship: "parent_observation" };
+    }
+    if (psd === "n") break;
   }
-  return { rec: null, source: null, inherited: false };
+  return parentObservation || { rec: null, source: null, relationship: null };
+}
+
+async function dmarcDomainExists(domain, q) {
+  await q(domain, "A");
+  if (typeof q.meta !== "function") return null;
+  let metadata;
+  try {
+    metadata = await q.meta(domain, "A");
+  } catch (error) {
+    return null;
+  }
+  if (metadata?.error) return null;
+  if (metadata?.status === 3) return false;
+  if (metadata?.status === 0) return true;
+  return null;
+}
+
+function dmarcPolicyForExistence(tags, domainExists) {
+  const policy = (preferred) => [tags[preferred] || tags.p || "", tags[preferred] ? preferred : "p"];
+  if (domainExists === true) return policy("sp");
+  if (domainExists === false) return policy("np");
+  const strength = { none: 1, quarantine: 2, reject: 3 };
+  const candidates = [policy("sp"), policy("np")];
+  return candidates.sort((left, right) => (strength[left[0]] || 0) - (strength[right[0]] || 0))[0];
+}
+
+async function dmarcPolicyContext(domain, q) {
+  const discovered = await discoverDmarc(domain, q);
+  const tags = dmarcTags(discovered.rec);
+  let effective = null;
+  let tag = null;
+  let domainExists = null;
+  if (discovered.relationship === "self") {
+    effective = tags.p || "";
+    tag = "p";
+  } else if (discovered.relationship === "organizational") {
+    effective = tags.sp || tags.p || "";
+    tag = tags.sp ? "sp" : "p";
+  } else if (discovered.relationship === "psd") {
+    domainExists = await dmarcDomainExists(domain, q);
+    [effective, tag] = dmarcPolicyForExistence(tags, domainExists);
+  }
+  return { ...discovered, tags, effective, tag, domainExists };
+}
+
+function appendNoDmarc(F) {
+  F.push({ area: "DMARC", severity: "critical", title: "No DMARC record",
+    detail: "No policy at _dmarc. Receivers have no instruction on how to handle unauthenticated mail in your name — and as of 2024-25, Gmail/Yahoo/Microsoft require DMARC for bulk senders. This is both a spoofing exposure and a hard deliverability blocker.",
+    fix: 'Publish TXT at _dmarc: start with "v=DMARC1; p=none; rua=mailto:dmarc@<domain>" to collect reports. Review those reports before any enforcement, then stage p=quarantine; whether p=reject is appropriate depends on your mail flows (RFC 9989 §7.4).' });
 }
 
 async function checkDmarc(domain, F, q) {
-  const disc = await discoverDmarc(domain, q);
+  const disc = await dmarcPolicyContext(domain, q);
   const rec = disc.rec;
   if (!rec) {
-    F.push({ area: "DMARC", severity: "critical", title: "No DMARC record",
-      detail: "No policy at _dmarc. Receivers have no instruction on how to handle unauthenticated mail in your name — and as of 2024-25, Gmail/Yahoo/Microsoft require DMARC for bulk senders. This is both a spoofing exposure and a hard deliverability blocker.",
-      fix: 'Publish TXT at _dmarc: start with "v=DMARC1; p=none; rua=mailto:dmarc@<domain>" to collect reports. Review those reports before any enforcement, then stage p=quarantine; whether p=reject is appropriate depends on your mail flows (RFC 9989 §7.4).' });
+    appendNoDmarc(F);
     return;
   }
-  const kv = {};
-  for (const m of rec.matchAll(/(\w+)=\s*([^;]+)/g)) kv[m[1].toLowerCase()] = m[2];
-  const p = (kv.p || "").trim().toLowerCase();
-  const sp = (kv.sp || "").trim().toLowerCase();
+  const kv = disc.tags;
+  const p = kv.p || "";
+  const sp = kv.sp || "";
+  const np = kv.np || "";
   const VALID_POLICY = new Set(["none", "quarantine", "reject"]);
 
-  if (disc.inherited) {
+  if (disc.relationship === "parent_observation") {
+    appendNoDmarc(F);
+    F.push({ area: "DMARC", severity: "low", title: "Parent DMARC record observed above registrable root",
+      detail: "The parent " + disc.source + " publishes \"" + rec + "\" (sp=" + (sp || "<missing>") + "; np=" + (np || "<missing>") + "). Without psd=y, it does not establish policy for " + domain + " under this audit's PSL-based organizational-domain resolution. RFC 9989 can apply an opted-in PSD record via its DNS Tree Walk. Separately, np=reject on the parent still covers nonexistent names beneath that parent.",
+      fix: "Publish the domain's own record at _dmarc." + domain + " if you want its DMARC policy under the domain owner's control.",
+      record: rec });
+    return;
+  }
+
+  if (disc.relationship === "psd") {
+    const eff = disc.effective;
+    const tag = disc.tag;
+    const strong = eff === "quarantine" || eff === "reject";
+    const title = strong
+      ? "DMARC enforced by platform policy (" + tag + "=" + eff + " from " + disc.source + ")"
+      : "DMARC platform policy is " + tag + "=" + (eff || "<missing>") + " from " + disc.source;
+    const sourceDetail = kv.psd === "y"
+      ? "The PSD " + disc.source + " publishes \"" + rec + "\"."
+      : "The organizational domain " + disc.source + " publishes \"" + rec + "\". A farther ancestor's psd=y record makes this the applicable organizational-domain policy.";
+    const existenceDetail = disc.domainExists === null
+      ? " The audited name's existence lookup was inconclusive, so Amino reports the weaker of its possible sp and np outcomes rather than treating the name as nonexistent."
+      : "";
+    F.push({ area: "DMARC", severity: strong ? "low" : "high", title,
+      detail: sourceDetail + " RFC 9989 applies its " + tag + "=" + (eff || "<missing>") + " policy to " + domain + "." + existenceDetail + " This policy is set and controlled by the platform, not the domain owner, and can change without notice to them.",
+      fix: "Publish the domain's own record at _dmarc." + domain + " to put policy under the domain owner's control, when you control that DNS name.",
+      record: rec });
+    return;
+  }
+
+  if (disc.relationship === "organizational") {
     // No _dmarc at this subdomain: it inherits the org domain's policy — the sp
     // (subdomain policy) tag if set, otherwise p (RFC 9989 tree walk).
-    const eff = sp || p;
+    const eff = disc.effective;
     const src = disc.source;
     if (!VALID_POLICY.has(eff) || eff === "none") {
-      F.push({ area: "DMARC", severity: "high", title: "DMARC subdomain not enforced (inherited " + (sp ? "sp" : "p") + "=" + (eff || "<missing>") + " from " + src + ")",
+      F.push({ area: "DMARC", severity: "high", title: "DMARC subdomain not enforced (inherited " + disc.tag + "=" + (eff || "<missing>") + " from " + src + ")",
         detail: "This subdomain has no _dmarc record; it inherits " + src + "'s policy, which resolves to " + (eff || "<missing>") + " — spoofed mail from this subdomain isn't stopped.",
         fix: "Publish _dmarc." + domain + " with p=reject, or set sp=reject on " + src + "." });
     } else {
-      F.push({ area: "DMARC", severity: "pass", title: "DMARC enforced (inherited " + (sp ? "sp" : "p") + "=" + eff + " from " + src + ")",
+      F.push({ area: "DMARC", severity: "pass", title: "DMARC enforced (inherited " + disc.tag + "=" + eff + " from " + src + ")",
         detail: "This subdomain has no record of its own and is covered by " + src + "'s enforced policy.", fix: null, record: rec });
     }
     return;
@@ -11553,6 +11656,7 @@ function action(f) {
   }
   if (a === "DMARC") {
     if (t.includes("no dmarc")) return "Publish a DMARC policy";
+    if (t.includes("platform policy") || t.includes("parent dmarc record observed")) return "Publish your own DMARC policy for control";
     if (t.includes("multiple dmarc")) return "Merge to a single DMARC record";
     if (t.includes("p=none (monitor")) return "Review DMARC reports, then stage quarantine";
     if (t.includes("subdomain policy")) return "Set DMARC sp=reject for subdomains";
@@ -11676,11 +11780,14 @@ async function bucketsWithQuery(domain, q) {
   r.DKIM = dkimState;
   if (dkimState !== "good") note.push(dkimNote);
 
-  const dmarc = await firstTxt("_dmarc." + domain, "v=dmarc1", q);
-  if (dmarc) {
+  const dmarcContext = await dmarcPolicyContext(domain, q);
+  const dmarc = dmarcContext.rec;
+  if (dmarc && (dmarcContext.relationship === "self" || dmarcContext.relationship === "psd")) {
     r.DMARC = true;
     const m = dmarc.match(/p=\s*(\w+)/);
-    const p = m ? m[1].toLowerCase() : "";
+    const p = dmarcContext.relationship === "psd"
+      ? dmarcContext.effective
+      : (m ? m[1].toLowerCase() : "");
     r.DMARC_enforced = p === "quarantine" || p === "reject";
     r.DMARC_rua = dmarc.replace(/ /g, "").includes("rua=");
     if (p === "none") note.push("DMARC p=none");
