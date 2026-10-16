@@ -1,25 +1,11 @@
-import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 
 const enginePath = process.env.ENGINE_FILE || new URL("../vendor/amino-audit-engine/engine.mjs", import.meta.url);
-const provenancePath = process.env.PROVENANCE_FILE || new URL("../vendor/amino-audit-engine/provenance.json", import.meta.url);
-const pinPath = process.env.ENGINE_PIN_FILE || new URL("../.github/amino-audit-engine.pin", import.meta.url);
-const skillsPinPath = process.env.SKILLS_PIN_FILE || new URL("../.github/amino-skills.pin", import.meta.url);
 const indexPath = process.env.INDEX_FILE || new URL("../src/index.mjs", import.meta.url);
 
 const bytes = readFileSync(enginePath);
 const source = bytes.toString("utf8");
-const provenance = JSON.parse(readFileSync(provenancePath, "utf8"));
-const pin = readFileSync(pinPath, "utf8").split("\n")
-  .filter((line) => line && !line.startsWith("#"))
-  .join("")
-  .trim();
-const skillsPin = readFileSync(skillsPinPath, "utf8").split("\n")
-  .filter((line) => line && !line.startsWith("#"))
-  .join("")
-  .trim();
 const indexSource = readFileSync(indexPath, "utf8");
-const sha256 = createHash("sha256").update(bytes).digest("hex");
 
 let passed = 0;
 let failed = 0;
@@ -28,15 +14,6 @@ function assert(name, condition) {
   if (condition) passed += 1;
   else failed += 1;
 }
-
-assert("engine pin is the reviewed merge SHA", pin === "f422788c0e7d0f7f2194dbb1366bf2b16a995103");
-assert("skills pin is the engine's reviewed contract pin", skillsPin === "8dc7be0846863263016729f0794f25567e2d3212");
-assert("provenance revision equals the consumer pin", provenance.revision === pin);
-assert("provenance source path is canonical", provenance.sourcePath === "src/engine.mjs");
-assert("provenance artifact path names the shipped copy", provenance.artifactPath === "vendor/amino-audit-engine/engine.mjs");
-assert("shipped engine byte count is pinned", bytes.length === provenance.bytes && bytes.length === 290979);
-assert("shipped engine SHA-256 is pinned", sha256 === provenance.sha256 && sha256 === "4b3191331745bfe14700b56fc0486ec0e22b89cd003f66f7c2361affda952de5");
-assert("contract version is pinned", provenance.contractVersion === "1.6.0" && /export const contractVersion = "1\.6\.0"/.test(source));
 
 // Relocated from test/conformance.mjs. These inspect the shipped canonical
 // artifact, while behavioral Action output/fail-on/finalize checks stay in their
@@ -72,6 +49,6 @@ assert("Action does not pass a resolver through the legacy q parameter", !/audit
 assert("deleted Pages engine is not imported", !/from "\.\/engine\.mjs"/.test(indexSource));
 assert("DOMAIN_RE comment does not claim canonical re-validation", !/engine re-validates strictly via its own DOMAIN_RE/.test(indexSource));
 
-console.log(`Shipped canonical artifact: ${bytes.length} bytes; SHA-256 ${sha256}`);
+console.log(`Shipped canonical artifact loaded for Action-only source checks: ${bytes.length} bytes.`);
 console.log(`Engine source/wiring contract: ${passed} passed, ${failed} failed.`);
 if (failed) process.exit(1);

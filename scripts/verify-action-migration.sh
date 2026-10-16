@@ -34,4 +34,4 @@ SURFACE=action ENGINE="$SHIPPED_ENGINE" node "$SKILLS_DIR/conformance/canary.mjs
 PARITY_PY="$SKILLS_DIR/amino-deliverability-audit/skills/amino-deliverability-audit/scripts/audit.py" \
   PARITY_JS="$SHIPPED_ENGINE" node "$SKILLS_DIR/web-parity/inventory.mjs"
 
-echo "ALL ACTION ENGINE 1.6.0 GATES PASS"
+echo "ALL ACTION ENGINE MIGRATION GATES PASS"

@@ -5,14 +5,7 @@ import { spawnSync } from "node:child_process";
 
 const root = process.cwd();
 const dir = mkdtempSync(join(tmpdir(), "amino-action-migration-canary-"));
-const engine = readFileSync("vendor/amino-audit-engine/engine.mjs");
-const provenance = JSON.parse(readFileSync("vendor/amino-audit-engine/provenance.json", "utf8"));
-const enginePin = readFileSync(".github/amino-audit-engine.pin", "utf8").split("\n")
-  .filter((line) => line && !line.startsWith("#")).join("").trim();
-const skillsPin = readFileSync(".github/amino-skills.pin", "utf8").split("\n")
-  .filter((line) => line && !line.startsWith("#")).join("").trim();
 const index = readFileSync("src/index.mjs", "utf8");
-const base = "996b7525234755de9ea6dc51fe5ad3b29a65f073";
 
 function runContract(env = {}) {
   return spawnSync(process.execPath, ["test/engine-source-contract.mjs"], {
@@ -24,10 +17,6 @@ function runContract(env = {}) {
 
 function outputOf(result) {
   return `${result.stdout || ""}\n${result.stderr || ""}`;
-}
-
-function wrongHex(value) {
-  return `${value.slice(0, -1)}${value.endsWith("0") ? "1" : "0"}`;
 }
 
 function expectContractRed(name, env, diagnostic) {
@@ -49,73 +38,12 @@ function expectCommandRed(name, command, args, options, diagnostic) {
 }
 
 try {
-  // Healthy control first: a broken detector must not get credit for rejecting mutations.
+  // Healthy control first: a broken Action-specific detector must not get
+  // credit for rejecting its wiring mutations. Engine identity mutations are
+  // owned once by the pinned engine's shared consumer-copy verifier suite.
   const healthy = runContract();
-  if (healthy.status !== 0) throw new Error(`healthy engine identity contract is red\n${outputOf(healthy)}`);
-  console.log("PASS C5 healthy engine identity contract is green");
-
-  const oldArtifactResult = spawnSync(
-    "git",
-    ["show", `${base}:vendor/amino-audit-engine/engine.mjs`],
-    { cwd: root, encoding: "buffer" },
-  );
-  if (oldArtifactResult.status !== 0) throw new Error("could not read the immutable prior artifact");
-  const oldArtifact = join(dir, "engine-prior.mjs");
-  writeFileSync(oldArtifact, oldArtifactResult.stdout);
-  expectContractRed(
-    "C5.1 engine pin bumped but artifact left at a prior revision",
-    { ENGINE_FILE: oldArtifact },
-    "FAIL shipped engine byte count is pinned",
-  );
-
-  const oldEnginePin = join(dir, "wrong-engine.pin");
-  writeFileSync(oldEnginePin, `${wrongHex(enginePin)}\n`);
-  expectContractRed(
-    "C5.2 artifact paired with a wrong engine pin",
-    { ENGINE_PIN_FILE: oldEnginePin },
-    "FAIL engine pin is the reviewed merge SHA",
-  );
-
-  const staleShaProvenance = join(dir, "provenance-stale-sha.json");
-  writeFileSync(staleShaProvenance, `${JSON.stringify({
-    ...provenance,
-    sha256: "0".repeat(64),
-  }, null, 2)}\n`);
-  expectContractRed(
-    "C5.3 provenance SHA-256 set to a wrong value",
-    { PROVENANCE_FILE: staleShaProvenance },
-    "FAIL shipped engine SHA-256 is pinned",
-  );
-
-  const staleVersionProvenance = join(dir, "provenance-stale-version.json");
-  writeFileSync(staleVersionProvenance, `${JSON.stringify({
-    ...provenance,
-    contractVersion: `${provenance.contractVersion}-wrong`,
-  }, null, 2)}\n`);
-  expectContractRed(
-    "C5.4 provenance contractVersion set to a wrong value",
-    { PROVENANCE_FILE: staleVersionProvenance },
-    "FAIL contract version is pinned",
-  );
-
-  const oldSkillsPin = join(dir, "wrong-skills.pin");
-  writeFileSync(oldSkillsPin, `${wrongHex(skillsPin)}\n`);
-  expectContractRed(
-    "C5.5 artifact paired with a wrong skills pin",
-    { SKILLS_PIN_FILE: oldSkillsPin },
-    "FAIL skills pin is the engine's reviewed contract pin",
-  );
-
-  const oneByteAltered = join(dir, "engine-one-byte-altered.mjs");
-  const altered = Buffer.from(engine);
-  altered[10] ^= 1;
-  writeFileSync(oneByteAltered, altered);
-  expectContractRed(
-    "C5.6 one byte altered inside the vendored artifact",
-    { ENGINE_FILE: oneByteAltered },
-    "FAIL shipped engine SHA-256 is pinned",
-  );
-  console.log("WHI-220 identity mutation canaries PASS: 6/6");
+  if (healthy.status !== 0) throw new Error(`healthy Action source/wiring contract is red\n${outputOf(healthy)}`);
+  console.log("PASS healthy Action source/wiring contract is green");
 
   // Keep the pre-existing host-wiring guards load-bearing.
   const sharedIndex = join(dir, "index.mjs");
@@ -128,16 +56,6 @@ try {
     "request-scoped adapter wiring canary",
     { INDEX_FILE: sharedIndex },
     "FAIL Action creates default adapters inside each audit call",
-  );
-
-  const mismatchedSkillsPin = join(dir, "mismatched-skills.pin");
-  writeFileSync(mismatchedSkillsPin, `${"0".repeat(40)}\n`);
-  expectCommandRed(
-    "consumer and engine skills pins must match",
-    "bash",
-    ["scripts/verify-pinned-engine.sh", join(dir, "current-engine")],
-    { cwd: root, env: { ...process.env, SKILLS_PIN_FILE: mismatchedSkillsPin } },
-    "::error::consumer skills pin 0000000000000000000000000000000000000000 does not equal pinned engine skills pin",
   );
 
   const driftClone = join(dir, "index-drift-clone");
