@@ -37,6 +37,23 @@ function expectCommandRed(name, command, args, options, diagnostic) {
   console.log(`PASS ${name}: ${diagnostic}`);
 }
 
+function cloneCommittedHead(name) {
+  const destination = join(dir, name);
+  const clone = spawnSync("git", ["clone", "--quiet", "--no-hardlinks", root, destination], { encoding: "utf8" });
+  if (clone.status !== 0) throw new Error(`could not clone the committed head for ${name}\n${clone.stderr}`);
+  return destination;
+}
+
+function replaceActionRuntime(cloneDir, replacement) {
+  const actionPath = join(cloneDir, "action.yml");
+  const action = readFileSync(actionPath, "utf8");
+  const anchor = '  using: "node24"';
+  if (action.split(anchor).length - 1 !== 1) {
+    throw new Error("Node 24 Action runtime canary anchor must occur exactly once");
+  }
+  writeFileSync(actionPath, action.replace(anchor, replacement));
+}
+
 try {
   // Healthy control first: a broken Action-specific detector must not get
   // credit for rejecting its wiring mutations. Engine identity mutations are
@@ -58,9 +75,7 @@ try {
     "FAIL Action creates default adapters inside each audit call",
   );
 
-  const driftClone = join(dir, "index-drift-clone");
-  const clone = spawnSync("git", ["clone", "--quiet", "--no-hardlinks", root, driftClone], { encoding: "utf8" });
-  if (clone.status !== 0) throw new Error(`could not clone the committed head for the host-surface canary\n${clone.stderr}`);
+  const driftClone = cloneCommittedHead("index-drift-clone");
   appendFileSync(join(driftClone, "src/index.mjs"), " ");
   const baselineIndex = join(dir, "baseline-index.mjs");
   const baselineAction = join(dir, "baseline-action.yml");
@@ -81,6 +96,45 @@ try {
       env: { ...process.env, BASELINE_INDEX: baselineIndex, BASELINE_ACTION: baselineAction },
     },
     "src/index.mjs changed outside the reviewed import, N3 comment, and per-audit wiring substitutions",
+  );
+
+  const actionDriftClone = cloneCommittedHead("action-drift-clone");
+  appendFileSync(join(actionDriftClone, "action.yml"), " ");
+  expectCommandRed(
+    "any other action.yml byte changed",
+    process.execPath,
+    ["test/host-surface-equivalence.mjs"],
+    {
+      cwd: actionDriftClone,
+      env: { ...process.env, BASELINE_INDEX: baselineIndex, BASELINE_ACTION: baselineAction },
+    },
+    "action.yml changed outside the reviewed node20 to node24 runtime substitution",
+  );
+
+  const node20Clone = cloneCommittedHead("action-node20-clone");
+  replaceActionRuntime(node20Clone, '  using: "node20"');
+  expectCommandRed(
+    "action.yml left at node20",
+    process.execPath,
+    ["test/host-surface-equivalence.mjs"],
+    {
+      cwd: node20Clone,
+      env: { ...process.env, BASELINE_INDEX: baselineIndex, BASELINE_ACTION: baselineAction },
+    },
+    "action.yml still declares node20; expected the reviewed node24 runtime substitution",
+  );
+
+  const node22Clone = cloneCommittedHead("action-node22-clone");
+  replaceActionRuntime(node22Clone, '  using: "node22"');
+  expectCommandRed(
+    "action.yml changed to a different runtime",
+    process.execPath,
+    ["test/host-surface-equivalence.mjs"],
+    {
+      cwd: node22Clone,
+      env: { ...process.env, BASELINE_INDEX: baselineIndex, BASELINE_ACTION: baselineAction },
+    },
+    "action.yml runtime must be node24",
   );
 } finally {
   rmSync(dir, { recursive: true, force: true });

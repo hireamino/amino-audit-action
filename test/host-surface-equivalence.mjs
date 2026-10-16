@@ -8,9 +8,9 @@ if (!baselineIndexPath || !baselineActionPath) {
 }
 
 const baselineIndex = readFileSync(baselineIndexPath, "utf8");
-const baselineAction = readFileSync(baselineActionPath);
+const baselineAction = readFileSync(baselineActionPath, "utf8");
 const currentIndex = readFileSync("src/index.mjs", "utf8");
-const currentAction = readFileSync("action.yml");
+const currentAction = readFileSync("action.yml", "utf8");
 
 const expectedIndex = baselineIndex
   .replace(
@@ -34,9 +34,22 @@ if (expectedIndex === baselineIndex) {
 if (currentIndex !== expectedIndex) {
   throw new Error("src/index.mjs changed outside the reviewed import, N3 comment, and per-audit wiring substitutions");
 }
-if (!currentAction.equals(baselineAction)) {
-  throw new Error("action.yml changed: Action inputs, outputs or runtime interface are not byte-identical to ae04a36");
+
+const baselineRuntime = '  using: "node20"';
+const reviewedRuntime = '  using: "node24"';
+if (baselineAction.split(baselineRuntime).length - 1 !== 1) {
+  throw new Error("immutable action.yml baseline must contain the Node 20 runtime exactly once");
+}
+const expectedAction = baselineAction.replace(baselineRuntime, reviewedRuntime);
+if (currentAction === baselineAction) {
+  throw new Error("action.yml still declares node20; expected the reviewed node24 runtime substitution");
+}
+if (!currentAction.includes(reviewedRuntime)) {
+  throw new Error("action.yml runtime must be node24");
+}
+if (currentAction !== expectedAction) {
+  throw new Error("action.yml changed outside the reviewed node20 to node24 runtime substitution");
 }
 
-console.log("Action host-surface equivalence PASS: action.yml is byte-identical to ae04a36.");
+console.log("Action host-surface equivalence PASS: action.yml differs from ae04a36 only by the reviewed node20 to node24 runtime substitution.");
 console.log("Action host-surface equivalence PASS: index output, fail-on, finalize, rendering and exit logic are byte-identical outside the three migration substitutions.");
