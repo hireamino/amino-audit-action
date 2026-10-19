@@ -54,6 +54,26 @@ function replaceActionRuntime(cloneDir, replacement) {
   writeFileSync(actionPath, action.replace(anchor, replacement));
 }
 
+function replaceIndexOnce(cloneDir, name, anchor, replacement) {
+  const indexPath = join(cloneDir, "src/index.mjs");
+  const source = readFileSync(indexPath, "utf8");
+  if (source.split(anchor).length - 1 !== 1) {
+    throw new Error(`${name} canary anchor must occur exactly once`);
+  }
+  writeFileSync(indexPath, source.replace(anchor, () => replacement));
+}
+
+function displayBlock(source) {
+  const startAnchor = "    lines.push(`###";
+  const endAnchor = '\n  }\n\n  lines.push("---");';
+  const start = source.indexOf(startAnchor);
+  const end = source.indexOf(endAnchor, start);
+  if (start < 0 || end < 0 || source.indexOf(startAnchor, start + 1) !== -1) {
+    throw new Error("summary display block anchors must identify exactly one block");
+  }
+  return source.slice(start, end + 5);
+}
+
 try {
   // Healthy control first: a broken Action-specific detector must not get
   // credit for rejecting its wiring mutations. Engine identity mutations are
@@ -95,7 +115,40 @@ try {
       cwd: driftClone,
       env: { ...process.env, BASELINE_INDEX: baselineIndex, BASELINE_ACTION: baselineAction },
     },
-    "src/index.mjs changed outside the reviewed import, N3 comment, and per-audit wiring substitutions",
+    "src/index.mjs changed outside the reviewed import, N3 comment, per-audit wiring, and Not confirmed display substitutions",
+  );
+
+  const missingDisplayClone = cloneCommittedHead("missing-display-clone");
+  const currentDisplay = displayBlock(readFileSync(join(missingDisplayClone, "src/index.mjs"), "utf8"));
+  const legacyDisplay = displayBlock(readFileSync(baselineIndex, "utf8"));
+  replaceIndexOnce(missingDisplayClone, "display block removed", currentDisplay, legacyDisplay);
+  expectCommandRed(
+    "reviewed Not confirmed display block removed",
+    process.execPath,
+    ["test/host-surface-equivalence.mjs"],
+    {
+      cwd: missingDisplayClone,
+      env: { ...process.env, BASELINE_INDEX: baselineIndex, BASELINE_ACTION: baselineAction },
+    },
+    "reviewed Not confirmed display block is missing or changed",
+  );
+
+  const resultReasonClone = cloneCommittedHead("result-reason-clone");
+  replaceIndexOnce(
+    resultReasonClone,
+    "result-level reason substitution",
+    "const issue = f.unconfirmed ? `${f.title} (Not confirmed: ${f.unconfirmed})` : f.title;",
+    "const issue = f.unconfirmed ? `${f.title} (Not confirmed: ${r.inconclusive_reason})` : f.title;",
+  );
+  expectCommandRed(
+    "display reason re-derived from result-level inconclusive_reason",
+    process.execPath,
+    ["test/host-surface-equivalence.mjs"],
+    {
+      cwd: resultReasonClone,
+      env: { ...process.env, BASELINE_INDEX: baselineIndex, BASELINE_ACTION: baselineAction },
+    },
+    "reviewed Not confirmed display block is missing or changed",
   );
 
   const actionDriftClone = cloneCommittedHead("action-drift-clone");

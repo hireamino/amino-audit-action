@@ -174,6 +174,10 @@ export function renderSummary(results, decision) {
   for (const r of results) {
     const { counts, verdict } = verdictLine(r);
     lines.push(`### \`${code(r.domain)}\` — ${verdict}`);
+    if (r.inconclusive && r.inconclusive_reason) {
+      lines.push("");
+      lines.push(`> We couldn't finish checking this domain. A DNS lookup failed (\`${code(r.inconclusive_reason)}\`), so anything reported below as missing may be wrong, especially findings marked Not confirmed. Re-run before acting on it.`);
+    }
     if (r.error) {
       lines.push("");
       lines.push(`> Audit failed: ${mdCell(r.error)}`);
@@ -193,7 +197,8 @@ export function renderSummary(results, decision) {
     lines.push("| --- | --- | --- | --- |");
     for (const f of gaps) {
       const sev = `${SEV_EMOJI[f.severity] || ""} ${mdCell(f.severity)}`.trim();
-      lines.push(`| ${sev} | ${mdCell(f.area)} | ${mdCell(f.title)} | ${mdCell(f.action || f.fix || "")} |`);
+      const issue = f.unconfirmed ? `${f.title} (Not confirmed: ${f.unconfirmed})` : f.title;
+      lines.push(`| ${sev} | ${mdCell(f.area)} | ${mdCell(issue)} | ${mdCell(f.action || f.fix || "")} |`);
     }
     lines.push("");
     // The table cell carries f.action, which is a short verb-led LABEL — deliberately so,
@@ -206,7 +211,10 @@ export function renderSummary(results, decision) {
     if (fixes.length) {
       lines.push("<details><summary>What to do about each of these</summary>");
       lines.push("");
-      for (const f of fixes) lines.push(`- **${mdCell(f.title)}** — ${mdCell(f.fix)}`);
+      for (const f of fixes) {
+        const fix = f.unconfirmed ? `Re-run the check first. If it's still reported: ${f.fix}` : f.fix;
+        lines.push(`- **${mdCell(f.title)}** — ${mdCell(fix)}`);
+      }
       lines.push("");
       lines.push("</details>");
       lines.push("");

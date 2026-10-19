@@ -2,7 +2,10 @@
 // Runs auditDomain() against canned DNS (mock resolver, no network) and asserts the
 // v1.2 batch-1 false-pass fixtures now produce the correct verdict. Exits non-zero on
 // any violation so it runs as a CI gate.
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { auditDomain, buckets, mtaStsPolicyProblems } from "../vendor/amino-audit-engine/engine.mjs";
+import { mdCell, renderSummary } from "../src/index.mjs";
 
 function makeQ(dns, dkimRec) {
   return async (name, type) => {
@@ -15,6 +18,42 @@ function makeQ(dns, dkimRec) {
 const titles = (F) => F.map((f) => f.area + ": " + f.title);
 let ok = true;
 const assert = (name, cond) => { ok = cond && ok; console.log((cond ? "PASS" : "FAIL"), name); };
+
+function fixtureQ(dns, http = {}, nowMs = 1767225600000) {
+  const norm = (name) => name.replace(/\.+$/, "").toLowerCase();
+  const map = {};
+  for (const [name, records] of Object.entries(dns || {})) map[norm(name)] = records;
+  const q = async (name, type) => {
+    name = norm(name);
+    if (map[name] && map[name][type]) return map[name][type];
+    for (const key of Object.keys(map)) {
+      if (key.startsWith("*._domainkey.") && name.endsWith(key.slice(1)) && map[key][type]) {
+        return map[key][type];
+      }
+    }
+    return [];
+  };
+  q.meta = async (name, rrtype) => {
+    const entry = map[norm(name)] || {};
+    const configured = entry.status !== undefined ? entry.status : 0;
+    const status = configured && typeof configured === "object" && !Array.isArray(configured)
+      ? (configured[String(rrtype || "").toUpperCase()] ?? 0)
+      : configured;
+    return { status, ad: !!entry.ad, error: false };
+  };
+  const response = (name) => http[name] === "unavailable" || http[name] === undefined
+    ? null : structuredClone(http[name]);
+  q.http = {
+    mtaSts: async () => response("mta_sts_policy"),
+    robots: async () => response("robots"),
+    rdap: async () => {
+      const value = response("rdap");
+      return value === null ? null : { status: value.status, data: value.data };
+    },
+  };
+  q.clock = { nowMs: () => nowMs };
+  return q;
+}
 
 { // I1 — revoked DKIM (empty p=) must not read as present
   const F = (await auditDomain("ex.com", makeQ({ "ex.com": {} }, "v=DKIM1; k=rsa; p="))).findings;
@@ -102,6 +141,57 @@ const assert = (name, cond) => { ok = cond && ok; console.log((cond ? "PASS" : "
   // §7.4 scopes BOTH its "SHOULD NOT publish p=reject" and its month-then-month
   // staging advice to domains hosting users who might post to mailing lists.
   // Neither may be restated here as universal advice.
+}
+
+{ // WHI-280 — Action rendering consumes, but never derives, engine-owned markers.
+  const skillsDir = process.env.SKILLS_DIR;
+  assert("WHI-280 pinned skills checkout is provided to the display contract", !!skillsDir);
+  if (skillsDir) {
+    const fixturePath = resolve(skillsDir, "conformance/fixtures.json");
+    const { fixtures } = JSON.parse(readFileSync(fixturePath, "utf8"));
+    const cases = fixtures.filter((fixture) => fixture.id.startsWith("inconclusive-") && fixture.expect?.inconclusive === true);
+    assert("WHI-280 display contract selects exactly 7 inconclusive fixtures", cases.length === 7);
+    for (const fixture of cases) {
+      const q = fixtureQ(fixture.input.dns, fixture.input.http, fixture.input.nowMs);
+      const result = await auditDomain(fixture.input.domain, q);
+      const summary = renderSummary([result], {
+        passed: false,
+        failBuild: false,
+        auditComplete: false,
+        level: "advisory",
+        reason: "fixture display contract",
+      });
+      const caution = `> We couldn't finish checking this domain. A DNS lookup failed (\`${fixture.expect.inconclusive_reason}\`), so anything reported below as missing may be wrong, especially findings marked Not confirmed. Re-run before acting on it.`;
+      assert(`${fixture.id} renders one exact inconclusive caution line`, summary.split(caution).length - 1 === 1);
+
+      const expected = fixture.expect.findings.filter((finding) => {
+        const surfaces = finding.surfaces || ["skill", "web", "action"];
+        return surfaces.includes("action") && finding.severity !== "pass";
+      });
+      for (const wanted of expected) {
+        const actual = result.findings.find((finding) => finding.area === wanted.area && finding.title === wanted.title);
+        assert(`${fixture.id} ${wanted.area}|${wanted.title} exists for Action display`, !!actual);
+        if (!actual) continue;
+        if (wanted.unconfirmed) {
+          const issue = `${actual.title} (Not confirmed: ${wanted.unconfirmed})`;
+          assert(
+            `${fixture.id} ${wanted.area}|${wanted.title} row uses finding.unconfirmed`,
+            summary.includes(`| ${mdCell(actual.area)} | ${mdCell(issue)} |`),
+          );
+          assert(
+            `${fixture.id} ${wanted.area}|${wanted.title} fix starts with the re-run lead-in`,
+            !actual.fix || summary.includes(`- **${mdCell(actual.title)}** — ${mdCell(`Re-run the check first. If it's still reported: ${actual.fix}`)}`),
+          );
+        } else {
+          assert(
+            `${fixture.id} ${wanted.area}|${wanted.title} unmarked row stays unmarked`,
+            summary.includes(`| ${mdCell(actual.area)} | ${mdCell(actual.title)} |`)
+              && !summary.includes(`${mdCell(actual.title)} \\(Not confirmed:`),
+          );
+        }
+      }
+    }
+  }
 }
 
 console.log(ok ? "\nALL PASS" : "\nSOME FAILED");
