@@ -12,9 +12,9 @@ if (!checkout) {
 
 const sourcePath = join(checkout, "src/engine.mjs");
 const source = readFileSync(sourcePath, "utf8");
-const anchor = '  CAA: "domain_posture",';
+const anchor = '      if (affected.has([finding.area, finding.title].join("\\0"))) finding.unconfirmed = reason;';
 const occurrences = source.split(anchor).length - 1;
-if (occurrences !== 1) throw new Error(`CAA lane mutation anchor must occur exactly once, got ${occurrences}`);
+if (occurrences !== 1) throw new Error(`per-finding reason mutation anchor must occur exactly once, got ${occurrences}`);
 
 const dir = mkdtempSync(join(tmpdir(), "amino-action-engine-suite-canary-"));
 const copy = join(dir, "engine");
@@ -23,7 +23,10 @@ try {
     recursive: true,
     filter: (path) => !path.endsWith("/.git") && !path.includes("/.git/") && !path.endsWith("/.cache") && !path.includes("/.cache/"),
   });
-  const mutatedSource = source.replace(anchor, () => '  CAA: "brand_optional",');
+  const mutatedSource = source.replace(
+    anchor,
+    () => '      if (affected.has([finding.area, finding.title].join("\\0"))) finding.unconfirmed = inconclusiveReason;',
+  );
   writeFileSync(join(copy, "src/engine.mjs"), mutatedSource);
   const provenancePath = join(copy, "engine.provenance.json");
   const provenance = JSON.parse(readFileSync(provenancePath, "utf8"));
@@ -40,9 +43,9 @@ try {
     encoding: "utf8",
   });
   const output = `${result.stdout || ""}\n${result.stderr || ""}`;
-  const diagnostic = 'dkim-revoked-empty-p.findings[CAA|No CAA records].lane: expected "domain_posture", got "brand_optional"';
+  const diagnostic = 'inconclusive-apex-txt-before-mx.findings[MTA-STS|No MTA-STS policy].unconfirmed: expected "MX ex.com: SERVFAIL/REFUSED", got "TXT ex.com: SERVFAIL/REFUSED"';
   if (result.status === 0 || !output.includes(diagnostic)) {
-    throw new Error(`mutated pinned engine suite did not fail through the named lane assertion\n${output}`);
+    throw new Error(`mutated pinned engine suite did not fail through the named per-finding reason assertion\n${output}`);
   }
   console.log(`Pinned engine suite canary PASS: ${diagnostic}`);
 } finally {

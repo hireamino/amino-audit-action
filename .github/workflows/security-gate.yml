@@ -49,7 +49,12 @@ jobs:
       - name: Run local test harness
         run: node test/local.mjs
 
+      - name: Clone amino-skills at the pinned revision (public, token-free)
+        run: scripts/fetch-pinned-skills.sh /tmp/amino-skills
+
       - name: Run conformance checks (correctness spec)
+        env:
+          SKILLS_DIR: /tmp/amino-skills
         run: node test/conformance.mjs
 
       - name: Verify shipped engine provenance and Action wiring
@@ -83,9 +88,6 @@ jobs:
           ENGINE_CHECKOUT: /tmp/amino-audit-engine
         run: node test/engine-suite-canary.mjs
 
-      - name: Clone amino-skills at the pinned revision (public, token-free)
-        run: scripts/fetch-pinned-skills.sh /tmp/amino-skills
-
       - name: Fixtures-driven conformance runner (shared corpus — hard gate)
         env:
           ENGINE: ${{ github.workspace }}/vendor/amino-audit-engine/engine.mjs
@@ -98,7 +100,7 @@ jobs:
           SURFACE: action
         run: node /tmp/amino-skills/conformance/canary.mjs
 
-      - name: Findings inventory (12 areas, 39 action labels)
+      - name: Findings inventory (12 areas, 40 action labels)
         env:
           PARITY_PY: /tmp/amino-skills/amino-deliverability-audit/skills/amino-deliverability-audit/scripts/audit.py
           PARITY_JS: ${{ github.workspace }}/vendor/amino-audit-engine/engine.mjs

@@ -60,7 +60,7 @@ async function mapPool(items, limit, fn) {
 // Per-request cache (stores in-flight promises so concurrent checks dedupe).
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const contractVersion = "1.7.0";
+export const contractVersion = "1.9.0";
 
 // Frozen mirror of amino-skills/conformance/address-contract.json. CI proves
 // these four lists are deeply equal to the exact reviewed skills pin, keeping
@@ -10622,17 +10622,24 @@ const PUBLIC_SUFFIX_RULES = parsePublicSuffixArtifact(PUBLIC_SUFFIX_ARTIFACT);
 export function registrableDomain(host) {
   if (typeof host !== "string" || host.startsWith(".")) return null;
   const normalized = host.replace(/\.+$/, "").toLowerCase();
-  if (!normalized) return null;
+  if (!normalized || /\s/u.test(normalized) || /[。．｡]/u.test(normalized)) return null;
   const display = normalized.split(".");
   if (display.some((label) => !label)) return null;
-  let ascii;
-  try {
-    ascii = new URL(`http://${normalized}`).hostname.replace(/\.+$/, "").toLowerCase();
-  } catch {
-    return null;
+  const labels = [];
+  for (const label of display) {
+    try {
+      // Convert one DNS label at a time. Whole-host URL parsing rewrites IPv4
+      // numeric shortcuts such as 0x7f.1, which is outside the DNS-name contract.
+      const suffix = ".invalid";
+      const encodedHost = new URL(`http://${label}${suffix}`).hostname.toLowerCase();
+      if (!encodedHost.endsWith(suffix)) return null;
+      const encoded = encodedHost.slice(0, -suffix.length);
+      if (!encoded || encoded.includes(".") || encoded.length > 63) return null;
+      labels.push(encoded);
+    } catch {
+      return null;
+    }
   }
-  const labels = ascii.split(".");
-  if (labels.length !== display.length || labels.some((label) => !label)) return null;
 
   let exceptionLength = 0;
   let matchLength = 1; // prevailing PSL default rule: *
@@ -10804,8 +10811,7 @@ async function mxProviders(domain, q) {
     if (parts.length >= 2 && /^\d+$/.test(parts[0])) {
       const host = parts[parts.length - 1].replace(/\.+$/, "").toLowerCase();
       if (!host) continue;
-      const labels = host.split(".");
-      const provider = labels.length >= 2 ? labels.slice(-2).join(".") : host;
+      const provider = registrableDomain(host) || host;
       out.push([parseInt(parts[0], 10), host, provider]);
     }
   }
@@ -11226,8 +11232,11 @@ async function checkDmarc(domain, F, q) {
   } else {
     const dests = [...rec.matchAll(/mailto:[^@\s;,]+@([^\s;,!]+)/gi)].map((m) => m[1]);
     const unauth = [];
+    const domainOrg = registrableDomain(domain);
     for (const dest of new Set(dests.map((d) => d.replace(/\.+$/, "").toLowerCase()))) {
-      if (registrableDomain(dest) !== registrableDomain(domain)) {
+      const destOrg = registrableDomain(dest);
+      const sameOrg = domainOrg !== null && destOrg !== null && domainOrg === destOrg;
+      if (!sameOrg) {
         const auth = await firstTxt(domain + "._report._dmarc." + dest, "v=dmarc1", q);
         if (!auth) unauth.push(dest);
       }
@@ -11747,14 +11756,33 @@ async function auditDomainWithPorts(domain, q, http, clock, dns) {
   // verdicts can't be trusted as "absent". Only NOERROR(0) and NXDOMAIN(3) are conclusive.
   // The Action folds this into audit-complete; other surfaces expose it downstream.
   let inconclusive = false, inconclusiveReason = null;
+  const criticalLookupFailures = [];
   if (typeof q === "function" && q.meta) {
     for (const [n, t] of [[domain, "TXT"], ["_dmarc." + domain, "TXT"], [domain, "MX"]]) {
       const m = await q.meta(n, t);
       if (dnsMetaFailed(m)) {
-        inconclusive = true;
-        inconclusiveReason = t + " " + n + ": " + ((m.status === 2 || m.status === 5) ? "SERVFAIL/REFUSED" : "lookup error");
-        break;
+        const reason = t + " " + n + ": " + ((m.status === 2 || m.status === 5) ? "SERVFAIL/REFUSED" : "lookup error");
+        criticalLookupFailures.push([n, t, reason]);
+        if (!inconclusive) {
+          inconclusive = true;
+          inconclusiveReason = reason;
+        }
       }
+    }
+  }
+  const unconfirmedDependencies = new Map([
+    [[domain, "TXT"].join("\0"), new Set(["SPF\0No SPF record"])],
+    [["_dmarc." + domain, "TXT"].join("\0"), new Set(["DMARC\0No DMARC record"])],
+    [[domain, "MX"].join("\0"), new Set([
+      "Transport\0No MX records",
+      "MTA-STS\0No MTA-STS policy",
+      "TLS-RPT\0No TLS-RPT",
+    ])],
+  ]);
+  for (const [name, rrtype, reason] of criticalLookupFailures) {
+    const affected = unconfirmedDependencies.get([name, rrtype].join("\0")) || new Set();
+    for (const finding of F) {
+      if (affected.has([finding.area, finding.title].join("\0"))) finding.unconfirmed = reason;
     }
   }
   return { domain, primary_mx: mxHost, summary, findings: F, observations, inconclusive, inconclusive_reason: inconclusiveReason };

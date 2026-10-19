@@ -15,8 +15,9 @@ cd "$ROOT"
 git show "$BASELINE_SHA:src/index.mjs" > "$BASELINE_INDEX"
 git show "$BASELINE_SHA:action.yml" > "$BASELINE_ACTION"
 
+scripts/fetch-pinned-skills.sh "$SKILLS_DIR"
 node test/local.mjs
-node test/conformance.mjs
+SKILLS_DIR="$SKILLS_DIR" node test/conformance.mjs
 node test/engine-source-contract.mjs
 node test/action-migration-canary.mjs
 node test/workflow-action-pins.mjs
@@ -28,7 +29,6 @@ bash scripts/verify-pinned-engine.sh "$TMP/canonical-engine"
 (cd "$TMP/canonical-engine" && bash scripts/verify.sh)
 ENGINE_CHECKOUT="$TMP/canonical-engine" node test/engine-suite-canary.mjs
 
-scripts/fetch-pinned-skills.sh "$SKILLS_DIR"
 SURFACE=action ENGINE="$SHIPPED_ENGINE" node "$SKILLS_DIR/conformance/run.mjs"
 SURFACE=action ENGINE="$SHIPPED_ENGINE" node "$SKILLS_DIR/conformance/canary.mjs"
 PARITY_PY="$SKILLS_DIR/amino-deliverability-audit/skills/amino-deliverability-audit/scripts/audit.py" \
