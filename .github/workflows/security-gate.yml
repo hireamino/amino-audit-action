@@ -100,7 +100,7 @@ jobs:
           SURFACE: action
         run: node /tmp/amino-skills/conformance/canary.mjs
 
-      - name: Findings inventory (12 areas, 39 action labels)
+      - name: Findings inventory (12 areas, 40 action labels)
         env:
           PARITY_PY: /tmp/amino-skills/amino-deliverability-audit/skills/amino-deliverability-audit/scripts/audit.py
           PARITY_JS: ${{ github.workspace }}/vendor/amino-audit-engine/engine.mjs
