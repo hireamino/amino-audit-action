@@ -12,7 +12,7 @@ if (!checkout) {
 
 const sourcePath = join(checkout, "src/engine.mjs");
 const source = readFileSync(sourcePath, "utf8");
-const anchor = '      if (affected.has([finding.area, finding.title].join("\\0"))) finding.unconfirmed = reason;';
+const anchor = '      if (affected.has([finding.area, finding.title].join("\\0")) && finding.unconfirmed === undefined) {\n        finding.unconfirmed = reason;';
 const occurrences = source.split(anchor).length - 1;
 if (occurrences !== 1) throw new Error(`per-finding reason mutation anchor must occur exactly once, got ${occurrences}`);
 
@@ -25,7 +25,7 @@ try {
   });
   const mutatedSource = source.replace(
     anchor,
-    () => '      if (affected.has([finding.area, finding.title].join("\\0"))) finding.unconfirmed = inconclusiveReason;',
+    () => '      if (affected.has([finding.area, finding.title].join("\\0")) && finding.unconfirmed === undefined) {\n        finding.unconfirmed = inconclusiveReason;',
   );
   writeFileSync(join(copy, "src/engine.mjs"), mutatedSource);
   const provenancePath = join(copy, "engine.provenance.json");
