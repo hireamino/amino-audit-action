@@ -19,7 +19,7 @@ const titles = (F) => F.map((f) => f.area + ": " + f.title);
 let ok = true;
 const assert = (name, cond) => { ok = cond && ok; console.log((cond ? "PASS" : "FAIL"), name); };
 
-function fixtureQ(dns, http = {}, nowMs = 1767225600000) {
+function fixtureQ(dns, http = {}, nowMs = 1767225600000, dnssecProbe = {}) {
   const norm = (name) => name.replace(/\.+$/, "").toLowerCase();
   const map = {};
   for (const [name, records] of Object.entries(dns || {})) map[norm(name)] = records;
@@ -41,6 +41,11 @@ function fixtureQ(dns, http = {}, nowMs = 1767225600000) {
       : configured;
     return { status, ad: !!entry.ad, error: false };
   };
+  const dnssecProbeMap = {};
+  for (const [name, evidence] of Object.entries(dnssecProbe || {})) {
+    dnssecProbeMap[norm(name)] = evidence;
+  }
+  q.dnssecProbe = async (name) => structuredClone(dnssecProbeMap[norm(name)] || {});
   const response = (name) => http[name] === "unavailable" || http[name] === undefined
     ? null : structuredClone(http[name]);
   q.http = {
@@ -150,9 +155,14 @@ function fixtureQ(dns, http = {}, nowMs = 1767225600000) {
     const fixturePath = resolve(skillsDir, "conformance/fixtures.json");
     const { fixtures } = JSON.parse(readFileSync(fixturePath, "utf8"));
     const cases = fixtures.filter((fixture) => fixture.id.startsWith("inconclusive-") && fixture.expect?.inconclusive === true);
-    assert("WHI-280 display contract selects exactly 7 inconclusive fixtures", cases.length === 7);
+    assert("WHI-280 display contract selects exactly 8 inconclusive fixtures", cases.length === 8);
     for (const fixture of cases) {
-      const q = fixtureQ(fixture.input.dns, fixture.input.http, fixture.input.nowMs);
+      const q = fixtureQ(
+        fixture.input.dns,
+        fixture.input.http,
+        fixture.input.nowMs,
+        fixture.input.dnssecProbe,
+      );
       const result = await auditDomain(fixture.input.domain, q);
       const summary = renderSummary([result], {
         passed: false,
