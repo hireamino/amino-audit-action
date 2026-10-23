@@ -11,7 +11,7 @@ issues. Coordinated disclosure is appreciated.
 ## What this Action does (and doesn't)
 
 `amino-audit-action` is **read-only**. It inspects a domain's public DNS over DoH
-(`cloudflare-dns.com`) and makes a few outbound HTTPS requests to assess email posture — to
+(`cloudflare-dns.com`, plus `dns.google` only to confirm a DNSSEC validation failure) and makes a few outbound HTTPS requests to assess email posture — to
 the MTA-STS policy host and to RDAP (domain age/expiry) — then writes a job summary, sets
 outputs, and optionally posts a scorecard as a comment on your own pull request. It never:
 
