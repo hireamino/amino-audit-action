@@ -19,6 +19,7 @@ scripts/fetch-pinned-skills.sh "$SKILLS_DIR"
 node test/local.mjs
 SKILLS_DIR="$SKILLS_DIR" node test/conformance.mjs
 node test/engine-source-contract.mjs
+node test/engine-adapter-seam.mjs
 node test/action-migration-canary.mjs
 node test/workflow-action-pins.mjs
 BASELINE_INDEX="$BASELINE_INDEX" BASELINE_ACTION="$BASELINE_ACTION" \

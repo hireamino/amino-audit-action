@@ -60,6 +60,9 @@ jobs:
       - name: Verify shipped engine provenance and Action wiring
         run: node test/engine-source-contract.mjs
 
+      - name: Prove DNS metadata and DNSSEC probe reach the shipped engine
+        run: node test/engine-adapter-seam.mjs
+
       - name: Canary shipped-artifact and request-scoped wiring gates
         run: node test/action-migration-canary.mjs
 
@@ -100,7 +103,7 @@ jobs:
           SURFACE: action
         run: node /tmp/amino-skills/conformance/canary.mjs
 
-      - name: Findings inventory (12 areas, 40 action labels)
+      - name: Findings inventory (12 areas, 41 action labels)
         env:
           PARITY_PY: /tmp/amino-skills/amino-deliverability-audit/skills/amino-deliverability-audit/scripts/audit.py
           PARITY_JS: ${{ github.workspace }}/vendor/amino-audit-engine/engine.mjs

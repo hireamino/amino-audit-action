@@ -60,7 +60,7 @@ async function mapPool(items, limit, fn) {
 // Per-request cache (stores in-flight promises so concurrent checks dedupe).
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const contractVersion = "1.10.0";
+export const contractVersion = "1.11.0";
 
 // Frozen mirror of amino-skills/conformance/address-contract.json. CI proves
 // these four lists are deeply equal to the exact reviewed skills pin, keeping
@@ -108,6 +108,111 @@ const BUCKET_LANES = Object.freeze({
 
 const RULE_ID_RE = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/;
 
+const RULE_EVALUATION_IDS = Object.freeze(`
+ai_visibility.robots_blocks
+bimi.missing
+bimi.no_vmc
+bimi.present
+caa.missing
+dkim.invalid_key
+dkim.not_found
+dkim.present
+dkim.testing_mode
+dkim.weak_rsa1024
+dmarc.enforced
+dmarc.inherited_enforced
+dmarc.inherited_not_enforced
+dmarc.invalid_policy
+dmarc.missing
+dmarc.monitor_only
+dmarc.multiple_records
+dmarc.no_rua
+dmarc.parent_observed
+dmarc.partial_pct
+dmarc.removed_tags
+dmarc.subdomain_not_enforced
+dmarc.unauthorized_report_destination
+dnssec.enabled
+dnssec.missing
+dnssec.validation_failing
+mta_sts.malformed
+mta_sts.missing
+mta_sts.mx_not_covered
+mta_sts.not_applicable
+mta_sts.policy_unreachable
+mta_sts.present
+mta_sts.unconfirmed
+mx.mixed_providers
+reputation.expiring
+reputation.new_domain
+spf.duplicate_include
+spf.lookup_limit
+spf.missing
+spf.multiple_records
+spf.no_all
+spf.permissive_all
+spf.present
+spf.ptr_mechanism
+spf.void_limit
+tls_rpt.missing
+tls_rpt.no_rua
+tls_rpt.present
+transport.dane_misconfigured
+transport.dane_missing
+transport.dane_present
+transport.dane_unvalidated
+transport.no_mx
+transport.null_mx
+transport.ptr_missing
+transport.ptr_not_fcrdns
+`.trim().split("\n"));
+
+const RULE_GROUPS = Object.freeze({
+  spf: RULE_EVALUATION_IDS.filter((rule) => rule.startsWith("spf.")),
+  dkim: RULE_EVALUATION_IDS.filter((rule) => rule.startsWith("dkim.")),
+  dmarc: RULE_EVALUATION_IDS.filter((rule) => rule.startsWith("dmarc.")),
+  mta_sts: RULE_EVALUATION_IDS.filter((rule) => rule.startsWith("mta_sts.")),
+  tls_rpt: RULE_EVALUATION_IDS.filter((rule) => rule.startsWith("tls_rpt.")),
+  bimi: RULE_EVALUATION_IDS.filter((rule) => rule.startsWith("bimi.")),
+  mx: ["mx.mixed_providers"],
+  transport: RULE_EVALUATION_IDS.filter((rule) =>
+    rule === "transport.no_mx" || rule === "transport.null_mx" || rule.startsWith("transport." + "dane_")),
+  rdns: ["transport.ptr_missing", "transport.ptr_not_fcrdns"],
+  dnssec: RULE_EVALUATION_IDS.filter((rule) => rule.startsWith("dnssec.")),
+  reputation: ["reputation.expiring", "reputation.new_domain"],
+  aibots: ["ai_visibility.robots_blocks"],
+  caa: ["caa.missing"],
+});
+
+// Closed source declaration consumed by ruleEvaluation(). Every engine-visible
+// finding rule owns at least one evidence scope; the verifier rejects drift.
+const RULE_INPUTS = Object.freeze(Object.fromEntries(
+  Object.entries(RULE_GROUPS).flatMap(([group, rules]) =>
+    rules.map((rule) => [rule, rule === "transport.ptr_not_fcrdns"
+      ? Object.freeze(["rdns", "rdns_forward"])
+      : ["tls_rpt.missing", "tls_rpt.no_rua"].includes(rule)
+        ? Object.freeze(["tls_rpt", "transport"])
+      : Object.freeze([group])])),
+));
+
+const declaredRuleInputs = Object.keys(RULE_INPUTS).sort();
+const expectedRuleInputs = [...RULE_EVALUATION_IDS].sort();
+if (JSON.stringify(declaredRuleInputs) !== JSON.stringify(expectedRuleInputs)) {
+  throw new Error("rule-evaluation input declarations must exactly match the 56-rule inventory");
+}
+for (const rule of RULE_EVALUATION_IDS) {
+  if (!Array.isArray(RULE_INPUTS[rule]) || RULE_INPUTS[rule].length === 0) {
+    throw new Error(`rule-evaluation input declaration is empty: ${rule}`);
+  }
+}
+
+const DMARC_OWN_RULES = Object.freeze(new Set([
+  "dmarc.enforced", "dmarc.invalid_policy", "dmarc.monitor_only",
+  "dmarc.multiple_records", "dmarc.no_rua", "dmarc.partial_pct",
+  "dmarc.removed_tags", "dmarc.subdomain_not_enforced",
+  "dmarc.unauthorized_report_destination",
+]));
+
 function finding(ruleId, fields, discriminator = "") {
   if (typeof ruleId !== "string" || !RULE_ID_RE.test(ruleId)) {
     throw new TypeError("invalid finding rule_id: " + String(ruleId));
@@ -153,6 +258,151 @@ function dnsFromLegacyQuery(query) {
     query: (name, rrtype) => query(name, rrtype),
     meta: typeof query.meta === "function" ? (name, rrtype) => query.meta(name, rrtype) : undefined,
     dnssecProbe: typeof query.dnssecProbe === "function" ? (name) => query.dnssecProbe(name) : undefined,
+  };
+}
+
+function normalizedDnsKey(name, rrtype) {
+  return [String(name).replace(/\.+$/, "").toLowerCase(), String(rrtype).toUpperCase()];
+}
+
+function evaluationDnsFailure(name, rrtype, meta) {
+  const status = meta?.status;
+  if (!meta || status === null || status === undefined) {
+    return `${rrtype} ${name}: metadata unavailable`;
+  }
+  if (meta.error || ![0, 3].includes(status)) {
+    const label = new Map([[1, "FORMERR"], [2, "SERVFAIL"], [4, "NOTIMP"], [5, "REFUSED"]]).get(status);
+    return `${rrtype} ${name}: ${label || "lookup error"}`;
+  }
+  return null;
+}
+
+function createEvaluationTrace(baseQuery) {
+  const dnsCache = new Map();
+  const dnsFailures = [];
+  const failureSeen = new Set();
+  const httpFailures = [];
+  const httpFailureSeen = new Set();
+  const probeCache = new Map();
+  let probeFailure = null;
+
+  async function read(name, rrtype) {
+    const [normalizedName, normalizedType] = normalizedDnsKey(name, rrtype);
+    const key = normalizedType + "\0" + normalizedName;
+    if (!dnsCache.has(key)) {
+      dnsCache.set(key, (async () => {
+        let rows = [];
+        let meta = null;
+        try {
+          rows = Array.from(await baseQuery(name, rrtype) || []);
+          if (typeof baseQuery.meta === "function") {
+            meta = await baseQuery.meta(name, rrtype);
+          }
+        } catch (error) {
+          rows = [];
+          meta = { status: null, error: true };
+        }
+        return { rows, meta, name: normalizedName, rrtype: normalizedType };
+      })());
+    }
+    return dnsCache.get(key);
+  }
+
+  function recordDnsFailure(scope, result) {
+    const reason = evaluationDnsFailure(result.name, result.rrtype, result.meta);
+    if (!reason) return;
+    const key = [scope, result.name, result.rrtype].join("\0");
+    if (failureSeen.has(key)) return;
+    failureSeen.add(key);
+    dnsFailures.push({ scope, name: result.name, rrtype: result.rrtype, reason });
+  }
+
+  async function probe(name) {
+    const normalizedName = normalizedDnsKey(name, "DNSKEY")[0];
+    if (!probeCache.has(normalizedName)) {
+      probeCache.set(normalizedName, (async () => {
+        if (typeof baseQuery.dnssecProbe !== "function") {
+          probeFailure = `DNSSEC probe ${normalizedName}: unavailable`;
+          return {};
+        }
+        try {
+          const evidence = await baseQuery.dnssecProbe(name);
+          if (!evidence) probeFailure = `DNSSEC probe ${normalizedName}: unavailable`;
+          return evidence || {};
+        } catch (error) {
+          probeFailure = `DNSSEC probe ${normalizedName}: unavailable`;
+          return {};
+        }
+      })());
+    }
+    return probeCache.get(normalizedName);
+  }
+
+  function scopedQuery(scope) {
+    const query = async (name, rrtype) => {
+      const result = await read(name, rrtype);
+      recordDnsFailure(scope, result);
+      return [...result.rows];
+    };
+    if (typeof baseQuery.meta === "function") {
+      query.meta = async (name, rrtype) => {
+        const result = await read(name, rrtype);
+        recordDnsFailure(scope, result);
+        return result.meta;
+      };
+    }
+    if (typeof baseQuery.dnssecProbe === "function") query.dnssecProbe = probe;
+    return query;
+  }
+
+  function recordHttpFailure(scope, target, response) {
+    const status = response?.status;
+    if (response && status !== 429 && !(Number.isInteger(status) && status >= 500)) return;
+    const reason = `${target}: ${response ? status : "unavailable"}`;
+    const key = scope + "\0" + reason;
+    if (httpFailureSeen.has(key)) return;
+    httpFailureSeen.add(key);
+    httpFailures.push({ scope, reason });
+  }
+
+  async function observeHttp(scope, target, call) {
+    try {
+      const response = await call();
+      recordHttpFailure(scope, target, response);
+      return response;
+    } catch (error) {
+      recordHttpFailure(scope, target, null);
+      throw error;
+    }
+  }
+
+  function scopedHttp(scope, http) {
+    return Object.freeze({
+      mtaSts: (domain, dns) => observeHttp(
+        scope,
+        `HTTP mta-sts.${domain}/.well-known/mta-sts.txt`,
+        () => http.mtaSts(domain, dns),
+      ),
+      robots: (domain, dns) => observeHttp(
+        scope,
+        `HTTP ${domain}/robots.txt`,
+        () => http.robots(domain, dns),
+      ),
+      rdap: (domain) => observeHttp(
+        scope,
+        `HTTP rdap.org/domain/${domain}`,
+        () => http.rdap(domain),
+      ),
+    });
+  }
+
+  return {
+    scopedQuery,
+    scopedHttp,
+    dnsFailures,
+    httpFailures,
+    hasDnssecProbe: typeof baseQuery.dnssecProbe === "function",
+    get probeFailure() { return probeFailure; },
   };
 }
 
@@ -343,8 +593,8 @@ const PUBLIC_SUFFIX_ARTIFACT = String.raw`// This Source Code Form is subject to
 
 // Generated by public-suffix/generate.py. DO NOT EDIT.
 // Source: https://publicsuffix.org/list/public_suffix_list.dat
-// VERSION: 2026-10-01_23-02-52_UTC
-// COMMIT: 6cd82aff889e3d64e5e03bc5c1f43da1934a960a
+// VERSION: 2026-10-22_08-36-41_UTC
+// COMMIT: 8437e5262f13305f94087abe699b4fe2be1d1de8
 // Format: SECTION<TAB>A-LABEL-RULE
 
 ICANN	ac
@@ -7350,6 +7600,7 @@ PRIVATE	barsy.ca
 PRIVATE	*.compute.estate
 PRIVATE	*.alces.network
 PRIVATE	alibabacloudcs.com
+PRIVATE	*.ztna-dingtalk.com
 PRIVATE	ms.fun
 PRIVATE	ms.show
 PRIVATE	kasserver.com
@@ -7390,9 +7641,32 @@ PRIVATE	execute-api.us-gov-east-1.amazonaws.com
 PRIVATE	execute-api.us-gov-west-1.amazonaws.com
 PRIVATE	execute-api.us-west-1.amazonaws.com
 PRIVATE	execute-api.us-west-2.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.ap-northeast-1.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.ap-northeast-2.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.ap-south-1.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.ap-south-2.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.ap-southeast-1.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.ap-southeast-2.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.ap-southeast-5.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.ap-southeast-7.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.ca-central-1.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.eu-central-1.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.eu-north-1.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.eu-south-1.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.eu-south-2.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.eu-west-1.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.eu-west-2.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.eu-west-3.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.sa-east-1.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.us-east-1.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.us-east-2.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.us-gov-west-1.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.us-west-1.amazonaws.com
+PRIVATE	consent-portal.bedrock-agentcore.us-west-2.amazonaws.com
 PRIVATE	cloudfront.net
 PRIVATE	auth.af-south-1.amazoncognito.com
 PRIVATE	auth.ap-east-1.amazoncognito.com
+PRIVATE	auth.ap-east-2.amazoncognito.com
 PRIVATE	auth.ap-northeast-1.amazoncognito.com
 PRIVATE	auth.ap-northeast-2.amazoncognito.com
 PRIVATE	auth.ap-northeast-3.amazoncognito.com
@@ -7403,6 +7677,7 @@ PRIVATE	auth.ap-southeast-2.amazoncognito.com
 PRIVATE	auth.ap-southeast-3.amazoncognito.com
 PRIVATE	auth.ap-southeast-4.amazoncognito.com
 PRIVATE	auth.ap-southeast-5.amazoncognito.com
+PRIVATE	auth.ap-southeast-6.amazoncognito.com
 PRIVATE	auth.ap-southeast-7.amazoncognito.com
 PRIVATE	auth.ca-central-1.amazoncognito.com
 PRIVATE	auth.ca-west-1.amazoncognito.com
@@ -7533,6 +7808,26 @@ PRIVATE	emrstudio-prod.us-west-1.amazonaws.com
 PRIVATE	emrappui-prod.us-west-2.amazonaws.com
 PRIVATE	emrnotebooks-prod.us-west-2.amazonaws.com
 PRIVATE	emrstudio-prod.us-west-2.amazonaws.com
+PRIVATE	amazonlightsail.com
+PRIVATE	*.ap-east-1.cs.amazonlightsail.com
+PRIVATE	*.ap-northeast-1.cs.amazonlightsail.com
+PRIVATE	*.ap-northeast-2.cs.amazonlightsail.com
+PRIVATE	*.ap-south-1.cs.amazonlightsail.com
+PRIVATE	*.ap-southeast-1.cs.amazonlightsail.com
+PRIVATE	*.ap-southeast-2.cs.amazonlightsail.com
+PRIVATE	*.ap-southeast-3.cs.amazonlightsail.com
+PRIVATE	*.ap-southeast-5.cs.amazonlightsail.com
+PRIVATE	*.ca-central-1.cs.amazonlightsail.com
+PRIVATE	*.eu-central-1.cs.amazonlightsail.com
+PRIVATE	*.eu-north-1.cs.amazonlightsail.com
+PRIVATE	*.eu-south-2.cs.amazonlightsail.com
+PRIVATE	*.eu-west-1.cs.amazonlightsail.com
+PRIVATE	*.eu-west-2.cs.amazonlightsail.com
+PRIVATE	*.eu-west-3.cs.amazonlightsail.com
+PRIVATE	*.sa-east-1.cs.amazonlightsail.com
+PRIVATE	*.us-east-1.cs.amazonlightsail.com
+PRIVATE	*.us-east-2.cs.amazonlightsail.com
+PRIVATE	*.us-west-2.cs.amazonlightsail.com
 PRIVATE	*.airflow.af-south-1.on.aws
 PRIVATE	*.airflow.ap-east-1.on.aws
 PRIVATE	*.airflow.ap-northeast-1.on.aws
@@ -7545,6 +7840,7 @@ PRIVATE	*.airflow.ap-southeast-2.on.aws
 PRIVATE	*.airflow.ap-southeast-3.on.aws
 PRIVATE	*.airflow.ap-southeast-4.on.aws
 PRIVATE	*.airflow.ap-southeast-5.on.aws
+PRIVATE	*.airflow.ap-southeast-7.on.aws
 PRIVATE	*.airflow.ca-central-1.on.aws
 PRIVATE	*.airflow.ca-west-1.on.aws
 PRIVATE	*.airflow.eu-central-1.on.aws
@@ -8113,13 +8409,18 @@ PRIVATE	ap-northeast-1.elasticbeanstalk.com
 PRIVATE	ap-northeast-2.elasticbeanstalk.com
 PRIVATE	ap-northeast-3.elasticbeanstalk.com
 PRIVATE	ap-south-1.elasticbeanstalk.com
+PRIVATE	ap-south-2.elasticbeanstalk.com
 PRIVATE	ap-southeast-1.elasticbeanstalk.com
 PRIVATE	ap-southeast-2.elasticbeanstalk.com
 PRIVATE	ap-southeast-3.elasticbeanstalk.com
+PRIVATE	ap-southeast-4.elasticbeanstalk.com
 PRIVATE	ap-southeast-5.elasticbeanstalk.com
+PRIVATE	ap-southeast-6.elasticbeanstalk.com
 PRIVATE	ap-southeast-7.elasticbeanstalk.com
 PRIVATE	ca-central-1.elasticbeanstalk.com
+PRIVATE	ca-west-1.elasticbeanstalk.com
 PRIVATE	eu-central-1.elasticbeanstalk.com
+PRIVATE	eu-central-2.elasticbeanstalk.com
 PRIVATE	eu-north-1.elasticbeanstalk.com
 PRIVATE	eu-south-1.elasticbeanstalk.com
 PRIVATE	eu-south-2.elasticbeanstalk.com
@@ -8164,6 +8465,7 @@ PRIVATE	lambda-url.us-west-2.on.aws
 PRIVATE	*.private.repost.aws
 PRIVATE	transfer-webapp.af-south-1.on.aws
 PRIVATE	transfer-webapp.ap-east-1.on.aws
+PRIVATE	transfer-webapp.ap-east-2.on.aws
 PRIVATE	transfer-webapp.ap-northeast-1.on.aws
 PRIVATE	transfer-webapp.ap-northeast-2.on.aws
 PRIVATE	transfer-webapp.ap-northeast-3.on.aws
@@ -8174,6 +8476,7 @@ PRIVATE	transfer-webapp.ap-southeast-2.on.aws
 PRIVATE	transfer-webapp.ap-southeast-3.on.aws
 PRIVATE	transfer-webapp.ap-southeast-4.on.aws
 PRIVATE	transfer-webapp.ap-southeast-5.on.aws
+PRIVATE	transfer-webapp.ap-southeast-6.on.aws
 PRIVATE	transfer-webapp.ap-southeast-7.on.aws
 PRIVATE	transfer-webapp.ca-central-1.on.aws
 PRIVATE	transfer-webapp.ca-west-1.on.aws
@@ -8200,6 +8503,7 @@ PRIVATE	transfer-webapp.us-west-1.on.aws
 PRIVATE	transfer-webapp.us-west-2.on.aws
 PRIVATE	transfer-webapp.cn-north-1.on.amazonwebservices.com.cn
 PRIVATE	transfer-webapp.cn-northwest-1.on.amazonwebservices.com.cn
+PRIVATE	transfer-webapp.eusc-de-east-1.on.amazonwebservices.eu
 PRIVATE	eero.online
 PRIVATE	eero-stage.online
 PRIVATE	opentunnel.xyz
@@ -9125,7 +9429,6 @@ PRIVATE	*.kunden.ortsinfo.at
 PRIVATE	*.statics.cloud
 PRIVATE	gadget.app
 PRIVATE	gadget.host
-PRIVATE	aliases121.com
 PRIVATE	campaign.gov.uk
 PRIVATE	service.gov.uk
 PRIVATE	independent-commission.uk
@@ -9147,7 +9450,6 @@ PRIVATE	githubusercontent.com
 PRIVATE	githubpreview.dev
 PRIVATE	github.io
 PRIVATE	gitlab.io
-PRIVATE	gitapp.si
 PRIVATE	gitpage.si
 PRIVATE	glideos.app
 PRIVATE	nog.community
@@ -9543,11 +9845,9 @@ PRIVATE	kiloapps.ai
 PRIVATE	kiloapps.io
 PRIVATE	kinghost.net
 PRIVATE	uni5.net
-PRIVATE	knightpoint.systems
 PRIVATE	koobin.events
 PRIVATE	webthings.io
 PRIVATE	krellian.net
-PRIVATE	oya.to
 PRIVATE	co.de
 PRIVATE	shiptoday.app
 PRIVATE	shiptoday.build
@@ -9820,6 +10120,45 @@ PRIVATE	x.mythic-beasts.com
 PRIVATE	yali.mythic-beasts.com
 PRIVATE	cust.retrosnub.co.uk
 PRIVATE	ui.nabu.casa
+PRIVATE	kr.object.fin-ncloudstorage.com
+PRIVATE	s3-website.kr.object.fin-ncloudstorage.com
+PRIVATE	kr.object.private.fin-ncloudstorage.com
+PRIVATE	kr.gov-ncloudstorage.com
+PRIVATE	kr-private.gov-ncloudstorage.com
+PRIVATE	kr.object.gov-ncloudstorage.com
+PRIVATE	s3-website.kr.object.gov-ncloudstorage.com
+PRIVATE	krs.object.gov-ncloudstorage.com
+PRIVATE	s3-website.krs.object.gov-ncloudstorage.com
+PRIVATE	kr.object.private.gov-ncloudstorage.com
+PRIVATE	krs.object.private.gov-ncloudstorage.com
+PRIVATE	kr.objectstorage.ncloud.com
+PRIVATE	sg.objectstorage.ncloud.com
+PRIVATE	kr.ncloudstorage.com
+PRIVATE	kr-naver.ncloudstorage.com
+PRIVATE	kr-naver-dev.ncloudstorage.com
+PRIVATE	kr-private.ncloudstorage.com
+PRIVATE	de.object.ncloudstorage.com
+PRIVATE	s3-website.de.object.ncloudstorage.com
+PRIVATE	kr.object.ncloudstorage.com
+PRIVATE	s3-website.kr.object.ncloudstorage.com
+PRIVATE	sg.object.ncloudstorage.com
+PRIVATE	s3-website.sg.object.ncloudstorage.com
+PRIVATE	us.object.ncloudstorage.com
+PRIVATE	s3-website.us.object.ncloudstorage.com
+PRIVATE	kr.object.private.ncloudstorage.com
+PRIVATE	sg.object.private.ncloudstorage.com
+PRIVATE	kr.website.ncloudstorage.com
+PRIVATE	kr-naver.website.ncloudstorage.com
+PRIVATE	kr-naver-dev.website.ncloudstorage.com
+PRIVATE	jp.object.ncpstorage.com
+PRIVATE	jp.jp4.object.ncpstorage.com
+PRIVATE	jp.jp5.object.ncpstorage.com
+PRIVATE	kr.object.ncpstorage.com
+PRIVATE	s3-website-jp.object.ncpstorage.com
+PRIVATE	jp.object.private.ncpstorage.com
+PRIVATE	jp.jp4.object.private.ncpstorage.com
+PRIVATE	jp.jp5.object.private.ncpstorage.com
+PRIVATE	kr.object.private.ncpstorage.com
 PRIVATE	needle.run
 PRIVATE	co.site
 PRIVATE	cloud.nospamproxy.com
@@ -10057,7 +10396,6 @@ PRIVATE	gh.srv.us
 PRIVATE	gl.srv.us
 PRIVATE	mypep.link
 PRIVATE	pplx.app
-PRIVATE	perspecta.cloud
 PRIVATE	forgeblocks.com
 PRIVATE	id.forgerock.io
 PRIVATE	support.site
@@ -10143,36 +10481,12 @@ PRIVATE	firewalledreplit.co
 PRIVATE	id.firewalledreplit.co
 PRIVATE	repl.co
 PRIVATE	id.repl.co
-PRIVATE	replit.dev
-PRIVATE	archer.replit.dev
-PRIVATE	bones.replit.dev
-PRIVATE	canary.replit.dev
-PRIVATE	global.replit.dev
-PRIVATE	hacker.replit.dev
-PRIVATE	id.replit.dev
-PRIVATE	janeway.replit.dev
-PRIVATE	kim.replit.dev
-PRIVATE	kira.replit.dev
-PRIVATE	kirk.replit.dev
-PRIVATE	odo.replit.dev
-PRIVATE	paris.replit.dev
-PRIVATE	picard.replit.dev
-PRIVATE	pike.replit.dev
-PRIVATE	prerelease.replit.dev
-PRIVATE	reed.replit.dev
-PRIVATE	riker.replit.dev
-PRIVATE	sisko.replit.dev
-PRIVATE	spock.replit.dev
-PRIVATE	staging.replit.dev
-PRIVATE	sulu.replit.dev
-PRIVATE	tarpit.replit.dev
-PRIVATE	teams.replit.dev
-PRIVATE	tucker.replit.dev
-PRIVATE	wesley.replit.dev
-PRIVATE	worf.replit.dev
+PRIVATE	*.replit.dev
+PRIVATE	*.teams.replit.dev
 PRIVATE	repl.run
 PRIVATE	resindevice.io
 PRIVATE	devices.resinstaging.io
+PRIVATE	retool.app
 PRIVATE	adimo.co.uk
 PRIVATE	itcouldbewor.se
 PRIVATE	aus.basketball
@@ -11438,7 +11752,7 @@ async function checkMtaSts(domain, F, q, http, dns, observations) {
 
 // ── TLS-RPT + BIMI ───────────────────────────────────────────────────────────
 
-async function checkSimple(domain, F, q) {
+async function checkTlsRpt(domain, F, q) {
   const tlsrpt = await firstTxt("_smtp._tls." + domain, "v=tlsrptv1", q);
   if (tlsrpt) {
     if (!tlsrpt.toLowerCase().includes("rua=")) {
@@ -11453,6 +11767,9 @@ async function checkSimple(domain, F, q) {
       detail: "No SMTP TLS reporting; you won't learn when senders fail to negotiate TLS to you.",
       fix: 'Add _smtp._tls TXT: "v=TLSRPTv1; rua=mailto:tlsrpt@<domain>".' }));
   }
+}
+
+async function checkBimi(domain, F, q) {
   const bimi = await firstTxt("default._bimi." + domain, "v=bimi1", q);
   if (bimi) {
     if (!/(?:^|;)\s*a=\s*https?:\/\//.test(bimi.toLowerCase())) {
@@ -11687,7 +12004,7 @@ async function checkAiBots(domain, F, q, http, dns, observations) {
 
 function reverseName(ip) { return ip.split(".").reverse().join(".") + ".in-addr.arpa"; }
 
-async function checkReverseDns(domain, F, q) {
+async function checkReverseDns(domain, F, q, forwardQuery = q) {
   const mx = await q(domain, "MX");
   if (!mx.length) return;
   if (isNullMx(mx)) return;
@@ -11708,7 +12025,7 @@ async function checkReverseDns(domain, F, q) {
     return;
   }
   const ptrName = ptr[0].replace(/\.+$/, "");
-  const fwd = await q(ptrName, "A");
+  const fwd = await forwardQuery(ptrName, "A");
   if (!fwd.includes(ip)) {
     F.push(finding("transport.ptr_not_fcrdns", { area: "Transport", severity: "low", title: "Mail server reverse DNS isn't forward-confirmed",
       detail: "The MX IP " + ip + " has a PTR (" + ptrName + ") but that name doesn't resolve back to the same IP — no forward-confirmed reverse DNS (FCrDNS). Some receivers read this as a spam signal.",
@@ -11813,10 +12130,72 @@ function action(f) {
     return t.includes("dane") ? "Publish DANE/TLSA records" : "Confirm STARTTLS on the mail server";
   }
   if (a === "CAA") return "Add a CAA record";
-  if (a === "DNSSEC") return "Enable DNSSEC";
+  if (a === "DNSSEC") {
+    return f.rule_id === "dnssec.validation_failing" ? "Fix DNSSEC signing" : "Enable DNSSEC";
+  }
   if (a === "Reputation") return t.includes("expires") ? "Renew the domain before it lapses" : "Warm up the domain before scaling sends";
   if (a === "AI visibility") return "Unblock AI crawlers in robots.txt";
   return f.title;
+}
+
+function ruleEvaluation(domain, trace) {
+  const ownDmarc = "_dmarc." + domain;
+  const out = {};
+  for (const rule of RULE_EVALUATION_IDS) {
+    const groups = RULE_INPUTS[rule];
+    const group = groups[0];
+    let candidates = trace.dnsFailures.filter((row) => groups.includes(row.scope));
+    // rdap.org is a fixed trusted bootstrap host. Reputation rules depend on
+    // the returned HTTP document, not the adapter's transport-level DNS read.
+    if (group === "reputation") candidates = [];
+    if (rule === "spf.present") {
+      candidates = candidates.filter((row) => row.name === domain && row.rrtype === "TXT");
+    } else if (rule === "dmarc.unauthorized_report_destination") {
+      candidates = candidates.filter((row) => row.rrtype === "TXT"
+        && (row.name === ownDmarc || row.name.includes("._report._dmarc.")));
+    } else if (DMARC_OWN_RULES.has(rule)) {
+      candidates = candidates.filter((row) => row.name === ownDmarc && row.rrtype === "TXT");
+    } else if (rule === "dmarc.missing"
+        || ["dmarc.parent_observed", "dmarc.inherited_not_enforced", "dmarc.inherited_enforced"].includes(rule)) {
+      candidates = candidates.filter((row) => !row.name.includes("._report._dmarc."));
+    } else if (rule === "tls_rpt.present") {
+      candidates = candidates.filter((row) => row.name === "_smtp._tls." + domain && row.rrtype === "TXT");
+    } else if (["tls_rpt.missing", "tls_rpt.no_rua"].includes(rule)) {
+      candidates = candidates.filter((row) =>
+        (row.scope === "tls_rpt" && row.name === "_smtp._tls." + domain && row.rrtype === "TXT")
+        || (row.scope === "transport" && row.name === domain && row.rrtype === "MX"));
+    } else if (rule === "mta_sts.not_applicable") {
+      candidates = candidates.filter((row) => row.name === domain && row.rrtype === "MX");
+    } else if (["mta_sts.missing", "mta_sts.unconfirmed"].includes(rule)) {
+      candidates = candidates.filter((row) =>
+        (row.name === domain && row.rrtype === "MX")
+        || (row.name === "_mta-sts." + domain && row.rrtype === "TXT"));
+    } else if (rule.startsWith("transport." + "dane_")) {
+      candidates = candidates.filter((row) => ["MX", "TLSA"].includes(row.rrtype));
+    } else if (["transport.no_mx", "transport.null_mx"].includes(rule)) {
+      candidates = candidates.filter((row) => row.name === domain && row.rrtype === "MX");
+    }
+    if (candidates.length) {
+      out[rule] = candidates[0].reason;
+      continue;
+    }
+    const usesHttp = ["reputation", "aibots"].includes(group)
+      || (group === "mta_sts" && [
+        "mta_sts.policy_unreachable", "mta_sts.malformed",
+        "mta_sts.present", "mta_sts.mx_not_covered",
+      ].includes(rule));
+    const httpFailure = usesHttp
+      ? trace.httpFailures.find((row) => groups.includes(row.scope))
+      : null;
+    if (httpFailure) {
+      out[rule] = httpFailure.reason;
+    } else if (group === "dnssec" && (trace.probeFailure || !trace.hasDnssecProbe)) {
+      out[rule] = trace.probeFailure || `DNSSEC probe ${domain}: unavailable`;
+    } else {
+      out[rule] = "conclusive";
+    }
+  }
+  return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -11826,7 +12205,9 @@ function action(f) {
 const SEV_ORDER = { critical: 0, high: 1, medium: 2, low: 3, pass: 4 };
 
 async function auditDomainWithPorts(domain, q, http, clock, dns) {
-  const spf = [], dkim = [], dmarc = [], mta = [], simple = [], transport = [], mxh = [],
+  const trace = createEvaluationTrace(q);
+  const scoped = (scope) => trace.scopedQuery(scope);
+  const spf = [], dkim = [], dmarc = [], mta = [], tlsrpt = [], bimi = [], transport = [], mxh = [],
     dnssec = [], rep = [], aibots = [], rdns = [], caa = [];
   let mxHost = null;
   const observations = {
@@ -11835,18 +12216,19 @@ async function auditDomainWithPorts(domain, q, http, clock, dns) {
     rdap: "unavailable",
   };
   await Promise.all([
-    checkSpf(domain, spf, q),
-    checkDkim(domain, dkim, q),
-    checkDmarc(domain, dmarc, q),
-    checkMtaSts(domain, mta, q, http, dns, observations),
-    checkSimple(domain, simple, q),
-    checkTransport(domain, transport, q).then((h) => { mxHost = h; }),
-    checkMxHygiene(domain, mxh, q),
-    checkDnssec(domain, dnssec, q),
-    checkDomainAge(domain, rep, http, clock, observations),
-    checkAiBots(domain, aibots, q, http, dns, observations),
-    checkReverseDns(domain, rdns, q),
-    checkCaa(domain, caa, q),
+    checkSpf(domain, spf, scoped("spf")),
+    checkDkim(domain, dkim, scoped("dkim")),
+    checkDmarc(domain, dmarc, scoped("dmarc")),
+    checkMtaSts(domain, mta, scoped("mta_sts"), trace.scopedHttp("mta_sts", http), dns, observations),
+    checkTlsRpt(domain, tlsrpt, scoped("tls_rpt")),
+    checkBimi(domain, bimi, scoped("bimi")),
+    checkTransport(domain, transport, scoped("transport")).then((h) => { mxHost = h; }),
+    checkMxHygiene(domain, mxh, scoped("mx")),
+    checkDnssec(domain, dnssec, scoped("dnssec")),
+    checkDomainAge(domain, rep, trace.scopedHttp("reputation", http), clock, observations),
+    checkAiBots(domain, aibots, scoped("aibots"), trace.scopedHttp("aibots", http), dns, observations),
+    checkReverseDns(domain, rdns, scoped("rdns"), scoped("rdns_forward")),
+    checkCaa(domain, caa, scoped("caa")),
   ]);
   // INBOUND-ONLY controls are not applicable to a domain that publishes a true null MX.
   // MTA-STS (RFC 8461) protects mail being delivered TO a domain. Recommending it for mail
@@ -11864,7 +12246,7 @@ async function auditDomainWithPorts(domain, q, http, clock, dns) {
         detail: "MTA-STS tells sending servers to require TLS when delivering TO this domain. This domain publishes a null MX, so there is no inbound delivery for a policy to protect. Not a gap.", fix: null,
       })]
     : mta;
-  const F = [...spf, ...dkim, ...dmarc, ...mtaApplicable, ...simple, ...transport, ...mxh, ...dnssec, ...rep, ...aibots, ...rdns, ...caa]
+  const F = [...spf, ...dkim, ...dmarc, ...mtaApplicable, ...tlsrpt, ...bimi, ...transport, ...mxh, ...dnssec, ...rep, ...aibots, ...rdns, ...caa]
     .filter((f) => !(nullMx && inboundOnly.has(f.area) && f.severity !== "pass"));
   F.sort((x, y) => (SEV_ORDER[x.severity] ?? 5) - (SEV_ORDER[y.severity] ?? 5));
   for (const f of F) {
@@ -11880,9 +12262,10 @@ async function auditDomainWithPorts(domain, q, http, clock, dns) {
   // The Action folds this into audit-complete; other surfaces expose it downstream.
   let inconclusive = false, inconclusiveReason = null;
   const criticalLookupFailures = [];
-  if (typeof q === "function" && q.meta) {
+  const criticalQuery = scoped("critical");
+  if (criticalQuery.meta) {
     for (const [n, t] of [[domain, "TXT"], ["_dmarc." + domain, "TXT"], [domain, "MX"]]) {
-      const m = await q.meta(n, t);
+      const m = await criticalQuery.meta(n, t);
       if (dnsMetaFailed(m)) {
         const reason = t + " " + n + ": " + ((m.status === 2 || m.status === 5) ? "SERVFAIL/REFUSED" : "lookup error");
         criticalLookupFailures.push([n, t, reason]);
@@ -11906,7 +12289,7 @@ async function auditDomainWithPorts(domain, q, http, clock, dns) {
     [[domain, "DNSKEY"].join("\0"), new Set(["DNSSEC\0DNSSEC not enabled"])],
     [[domain, "CAA"].join("\0"), new Set(["CAA\0No CAA records"])],
   ]);
-  const lookupFailures = await findingLookupFailures(domain, q, criticalLookupFailures);
+  const lookupFailures = await findingLookupFailures(domain, scoped("markers"), criticalLookupFailures);
   for (const [name, rrtype, reason] of lookupFailures) {
     let affected = unconfirmedDependencies.get([name, rrtype].join("\0")) || new Set();
     if (rrtype === "TXT" && name.endsWith("._domainkey." + domain)) {
@@ -11918,7 +12301,16 @@ async function auditDomainWithPorts(domain, q, http, clock, dns) {
       }
     }
   }
-  return { domain, primary_mx: mxHost, summary, findings: F, observations, inconclusive, inconclusive_reason: inconclusiveReason };
+  return {
+    domain,
+    primary_mx: mxHost,
+    summary,
+    findings: F,
+    observations,
+    rule_evaluation: ruleEvaluation(domain, trace),
+    inconclusive,
+    inconclusive_reason: inconclusiveReason,
+  };
 }
 
 // batch_score.py parity surface — the DNS-only, edge-safe Y/N/N/A buckets + gap.

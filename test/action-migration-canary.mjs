@@ -37,6 +37,26 @@ function expectCommandRed(name, command, args, options, diagnostic) {
   console.log(`PASS ${name}: ${diagnostic}`);
 }
 
+function engineCopyWithMutation(name, anchor, replacement) {
+  const source = readFileSync("vendor/amino-audit-engine/engine.mjs", "utf8");
+  if (source.split(anchor).length - 1 !== 1) {
+    throw new Error(`${name} engine canary anchor must occur exactly once`);
+  }
+  const destination = join(dir, `${name}.mjs`);
+  writeFileSync(destination, source.replace(anchor, () => replacement));
+  return destination;
+}
+
+function expectSeamRed(name, engineFile, diagnostic) {
+  expectCommandRed(
+    name,
+    process.execPath,
+    ["test/engine-adapter-seam.mjs"],
+    { cwd: root, env: { ...process.env, ENGINE_FILE: engineFile } },
+    diagnostic,
+  );
+}
+
 function cloneCommittedHead(name) {
   const destination = join(dir, name);
   const clone = spawnSync("git", ["clone", "--quiet", "--no-hardlinks", root, destination], { encoding: "utf8" });
@@ -81,6 +101,33 @@ try {
   const healthy = runContract();
   if (healthy.status !== 0) throw new Error(`healthy Action source/wiring contract is red\n${outputOf(healthy)}`);
   console.log("PASS healthy Action source/wiring contract is green");
+
+  const healthySeam = spawnSync(process.execPath, ["test/engine-adapter-seam.mjs"], {
+    cwd: root,
+    encoding: "utf8",
+  });
+  if (healthySeam.status !== 0) throw new Error(`healthy Action adapter seam is red\n${outputOf(healthySeam)}`);
+  console.log("PASS healthy Action adapter seam is green");
+
+  const metaAnchor = `  if (typeof dns.meta === "function") {
+    query.meta = (name, rrtype) => dns.meta(name, rrtype);
+  }
+`;
+  expectSeamRed(
+    "dns.meta adapter seam removed",
+    engineCopyWithMutation("missing-meta-seam", metaAnchor, ""),
+    "ENGINE ADAPTER SEAM dns.meta reached the shipped engine",
+  );
+
+  const probeAnchor = `  if (typeof dns.dnssecProbe === "function") {
+    query.dnssecProbe = (name) => dns.dnssecProbe(name);
+  }
+`;
+  expectSeamRed(
+    "dns.dnssecProbe adapter seam removed",
+    engineCopyWithMutation("missing-dnssec-probe-seam", probeAnchor, ""),
+    "ENGINE ADAPTER SEAM dns.dnssecProbe reached the shipped engine",
+  );
 
   // Keep the pre-existing host-wiring guards load-bearing.
   const sharedIndex = join(dir, "index.mjs");
